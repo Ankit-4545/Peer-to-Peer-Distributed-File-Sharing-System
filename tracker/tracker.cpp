@@ -20,7 +20,6 @@
 #include <ctime>
 
 #include "files.h"
-
 using namespace std;
 
 struct User{
@@ -44,7 +43,7 @@ const string SYNC_LOG="sync_log.txt";
 off_t last_offset=0;
 mutex file_mutex;
 
-bool is_logged_in(const string &uid, const string &sess) {
+bool is_logged_in(const string &uid, const string &sess){
     lock_guard<mutex> lock(state_mutex);
     return users.count(uid) && users[uid].loggedin && users[uid].session == sess;
 }
@@ -56,156 +55,113 @@ bool set_session(const string &uid, const string &sess, string &current_user, st
     current_session = sess;
     return true;
 }
-
-
 vector<string> split(const string &s,char delim){
-    vector<string> out;string cur;
+    vector<string> out; string cur;
     for(char c:s){
         if(c==delim){
             out.push_back(cur);
             cur.clear();
         }
-        else {
-            cur.push_back(c);
-        }
+        else cur.push_back(c);
     }
     out.push_back(cur);
     return out;
 }
 
 void apply_op_line(const string &line){
-    if(line.empty()) {
-        return;
-    }
+    if(line.empty()) return;
     vector<string> parts=split(line,'|');
-    if(parts.size()==0){
-        return;
-    }
+    if(parts.size()==0) return;
     lock_guard<mutex>lock(state_mutex);
 
-    if(parts[0]=="CREATE_USER"){
-        if(parts.size()!=3){
-            return;
-        }
+    if(parts[0]=="CREATE_USER" && parts.size()==3){
         string uid=parts[1];
         string pw=parts[2];
-        if(!users.count(uid)){
-            users[uid].password=pw;
-            users[uid].loggedin=false;
-            users[uid].session="";
-        }
+        if(!users.count(uid)) users[uid]={pw,false, ""};
         return;
     }
 
-    if(parts[0]=="CREATE_GROUP"){
-        if(parts.size()!=3) return;
-        string gid=parts[1];
-        string own=parts[2];
+    if(parts[0]=="CREATE_GROUP" && parts.size()==3){
+    string gid=parts[1], own=parts[2];
+    if(!groups.count(gid)) {
+    groups[gid]={own,{own},{}};
+    }
+    return;
+    }
 
-        if(!groups.count(gid)){
-            Group g;
-            g.owner = own;
-            g.members.push_back(own);
-            // requests is empty by default
-            groups[gid] = g; 
+    if(parts[0] == "JOIN_REQ" && parts.size() == 3) {
+        string gid = parts[1], uid = parts[2];
+        if(groups.count(gid)) {
+            auto &reqs = groups[gid].requests;
+            if(find(reqs.begin(), reqs.end(), uid) == reqs.end()) {
+                reqs.push_back(uid);
+            }
         }
         return;
     }
-
-    if(parts[0]=="JOIN_REQ"){
-        if(parts.size()!=3) return;
-        string gid=parts[1];
-        string uid=parts[2];
-        if(groups.count(gid)){
-            groups[gid].requests.push_back(uid);
-        }
-        return;
-    }
-
-    if(parts[0]=="ACCEPT_REQ"){
-        if(parts.size()!=3) return;
-        string gid=parts[1];
-        string uid=parts[2];
-        if(groups.count(gid)){
+    if(parts[0] == "ACCEPT_REQ" && parts.size() == 3) {
+        string gid = parts[1], uid = parts[2];
+        if(groups.count(gid)) {
             auto &r = groups[gid].requests;
             r.erase(remove(r.begin(), r.end(), uid), r.end());
-            groups[gid].members.push_back(uid);
+            auto &m = groups[gid].members;
+            if(find(m.begin(), m.end(), uid) == m.end()) {
+                m.push_back(uid);
+            }
         }
         return;
     }
-    if(parts[0]=="LOGIN"){
-        if(parts.size()!=3) return;
-        string uid=parts[1];
-        string sid=parts[2];
-        if(users.count(uid)){
+
+
+    if(parts[0]=="LOGIN" && parts.size()==3){
+        string uid=parts[1], sid=parts[2];
+        if(users.count(uid)) {
             users[uid].loggedin=true;
             users[uid].session=sid;
         }
         return;
     }
 
-    if(parts[0]=="LOGOUT"){
-        if(parts.size()!=2) return;
+    if(parts[0]=="LOGOUT" && parts.size()==2){
         string uid=parts[1];
-        if(users.count(uid)){
-            users[uid].loggedin=false;
-            users[uid].session="";
+        if(users.count(uid)){ 
+            users[uid].loggedin=false; 
+            users[uid].session=""; 
         }
         return;
     }
 
-
-    if(parts[0]=="LEAVE_GROUP"){
-        if(parts.size()!=3) return;
-        string gid=parts[1];
-        string uid=parts[2];
+    if(parts[0]=="LEAVE_GROUP" && parts.size()==3){
+        string gid=parts[1], uid=parts[2];
         if(groups.count(gid)){
-            auto &m = groups[gid].members;
+            auto &m=groups[gid].members;
             m.erase(remove(m.begin(), m.end(), uid), m.end());
         }
         return;
     }
 
-    if(parts[0]=="UPLOAD_FILE"){
-        // format: UPLOAD_FILE|<gid>|<filename>|<filesize>|<peerip:peerport>|<filehash>|<piecehash1>,<piecehash2>,...
-        if(parts.size()<7) return;
-        string gid=parts[1];
-        string filename=parts[2];
-        uint64_t filesize=0;
-        try{ filesize=(uint64_t)stoull(parts[3]); } catch(...) { filesize=0; }
-        string peer=parts[4];
-        string filehash=parts[5];
-        string piecehashes_str=parts[6];
-        vector<string> ph=split(piecehashes_str,',');
-        if(!group_files.count(gid)) group_files[gid]=map<string,FileMeta>();
-        FileMeta fm;
-        fm.filename=filename;fm.filesize=filesize;fm.filehash=filehash;fm.piece_hashes=ph;
-        if(group_files[gid].count(filename)){
+    if(parts[0]=="UPLOAD_FILE" && parts.size()>=7){
+        string gid=parts[1], filename=parts[2];
+        uint64_t filesize=stoull(parts[3]);
+        string peer=parts[4], filehash=parts[5];
+        vector<string> ph=split(parts[6],',');
+        if(!group_files.count(gid)) group_files[gid]={};
+        FileMeta fm={filename,filesize,filehash,ph,{peer}};
+        if(group_files[gid].count(filename)) {
             FileMeta &old=group_files[gid][filename];
-            if(find(old.seeders.begin(),old.seeders.end(),peer)==old.seeders.end()){
-                old.seeders.push_back(peer);
-            }
-        } else {
-            fm.seeders.clear();fm.seeders.push_back(peer);
-            group_files[gid][filename]=fm;
-        }
+            if(find(old.seeders.begin(),old.seeders.end(),peer)==old.seeders.end()) old.seeders.push_back(peer);
+        } 
+        else group_files[gid][filename]=fm;
         return;
     }
 
-    if(parts[0]=="STOP_SHARE"){
-        // format: STOP_SHARE|<gid>|<filename>|<peerip:peerport>
-        if(parts.size()!=4) return;
-        string gid=parts[1];
-        string filename=parts[2];
-        string peer=parts[3];
+    if(parts[0]=="STOP_SHARE" && parts.size()==4){
+        string gid=parts[1], filename=parts[2], peer=parts[3];
         if(group_files.count(gid) && group_files[gid].count(filename)){
             FileMeta &fm=group_files[gid][filename];
-            fm.seeders.erase(remove(fm.seeders.begin(),fm.seeders.end(),peer),fm.seeders.end());
-            if(fm.seeders.empty()){
-                group_files[gid].erase(filename);
-            }
+            fm.seeders.erase(remove(fm.seeders.begin(),fm.seeders.end(),peer), fm.seeders.end());
+            if(fm.seeders.empty()) group_files[gid].erase(filename);
         }
-        return;
     }
 }
 
@@ -213,7 +169,7 @@ bool append_op_to_log(const string &line){
     lock_guard<mutex> lock(file_mutex);
     int fd=open(SYNC_LOG.c_str(),O_WRONLY|O_APPEND|O_CREAT,0644);
     if(fd<0){
-        cerr<<"open("<<SYNC_LOG<<") failed: "<<strerror(errno)<<"\n";
+        cerr<<"open("<<SYNC_LOG<<") failed: "<<strerror(errno)<<"\n"; 
         return false;
     }
     string out=line+"\n";
@@ -225,63 +181,58 @@ bool append_op_to_log(const string &line){
 void replay_log_full(){
     int fd0=open(SYNC_LOG.c_str(),O_RDONLY);
     if(fd0<0){
-        if(errno==ENOENT){
-            int fdw=open(SYNC_LOG.c_str(),O_WRONLY|O_CREAT,0644);
-            if(fdw>=0){
-                close(fdw);
-            }
-        }
+        if(errno==ENOENT){ 
+            int fdw=open(SYNC_LOG.c_str(),O_WRONLY|O_CREAT,0644); 
+            if(fdw>=0) close(fdw); 
+        } 
     }
-    else{
-        close(fd0);
-    }
+    else close(fd0);
+
     lock_guard<mutex> lock(file_mutex);
     int fd=open(SYNC_LOG.c_str(),O_RDONLY);
     if(fd<0){
-        last_offset=0;
+        last_offset=0; 
         return;
     }
+
     string acc;
-    const int BUF=4096;
-    char buf[BUF];
-    ssize_t r;
+    const int BUF=4096; char buf[BUF]; ssize_t r;
     while((r=read(fd,buf,BUF))>0){
         acc.append(buf,(size_t)r);
         size_t pos=0;
         while(true){
             size_t nl=acc.find('\n',pos);
-            if(nl==string::npos)
-                break;
-                string line=acc.substr(pos,nl-pos);
-                apply_op_line(line);pos=nl+1;
-            }
-            if(pos>0){
-                acc.erase(0,pos);
-            }
+            if(nl==string::npos) break;
+            string line=acc.substr(pos,nl-pos);
+            apply_op_line(line); pos=nl+1;
         }
-    off_t off=lseek(fd,0,SEEK_END);
-    if(off<0){
-        off=0;
+        if(pos>0) acc.erase(0,pos);
     }
-    last_offset=off;
+    off_t off=lseek(fd,0,SEEK_END);
+    last_offset=(off<0)?0:off;
     close(fd);
+    lock_guard<mutex>lock(state_mutex);
+    for (auto &kv:users){
+        kv.second.loggedin=false;
+        kv.second.session="";
+    }
 }
+
+
 
 void read_new_ops_from_log(){
     lock_guard<mutex> lock(file_mutex);
     int fd=open(SYNC_LOG.c_str(),O_RDONLY);
-    if(fd<0){
+    if(fd<0) return;
+    if(lseek(fd,last_offset,SEEK_SET)==(off_t)-1){ 
+        last_offset=lseek(fd,0,SEEK_END); 
+        close(fd); 
         return;
     }
-    if(lseek(fd,last_offset,SEEK_SET)==(off_t)-1){
-        off_t off=lseek(fd,0,SEEK_END);
-        last_offset=(off<0)?0:off;
-        close(fd);
-        return;
-    }
-    string acc;
-    const int BUF=4096;
-    char buf[BUF];
+
+    string acc; 
+    const int BUF=4096; 
+    char buf[BUF]; 
     ssize_t r;
     while((r=read(fd,buf,BUF))>0){
         acc.append(buf,(size_t)r);
@@ -290,8 +241,7 @@ void read_new_ops_from_log(){
             size_t nl=acc.find('\n',pos);
             if(nl==string::npos) break;
             string line=acc.substr(pos,nl-pos);
-            apply_op_line(line);
-            pos=nl+1;
+            apply_op_line(line); pos=nl+1;
         }
         if(pos>0) acc.erase(0,pos);
     }
@@ -301,185 +251,165 @@ void read_new_ops_from_log(){
 }
 
 void watcher_thread(){
-    while(true){
-        read_new_ops_from_log();
+    while(true){ 
+        read_new_ops_from_log(); 
         this_thread::sleep_for(chrono::milliseconds(800));
     }
 }
 
 bool send_reply_with_marker(int fd,const string &reply){
-    string out=reply;
-    if(out.size()==0||out.back()!='\n') out+="\n";
+    string out=reply; 
+    if(out.empty()||out.back()!='\n') out+="\n";
     out+="END_OF_REPLY\n";
     size_t sent=0;
     while(sent<out.size()){
         ssize_t s=send(fd,out.c_str()+sent,out.size()-sent,0);
-        if(s<=0) {
-            return false;
-        }
+        if(s<=0) return false;
         sent+=(size_t)s;
     }
     return true;
 }
 
 string generate_session(){
-    string chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    string chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; 
     string tok;
-    for(int i=0;i<16;i++){
-        tok+=chars[rand()%chars.size()];
-    }
+    for(int i=0;i<16;i++) tok+=chars[rand()%chars.size()];
     return tok;
 }
 
+
 void handle_client(int client_fd){
-    string current_user;
-    string current_session;
-    const int BUF=4096;
-    char buf[BUF];
+    string current_user, 
+    current_session;
+    const int BUF=4096; 
+    char buf[BUF]; 
     string acc;
+
     while(true){
         ssize_t r=recv(client_fd,buf,BUF,0);
-        if(r<=0){
-            break;
-        }
+        if(r<=0) break;
         acc.append(buf,(size_t)r);
         while(true){
             size_t nl=acc.find('\n');
-            if(nl==string::npos) {
-                break;
-            }
-            string line=acc.substr(0,nl);
+            if(nl==string::npos) break;
+            string line=acc.substr(0,nl); 
             acc.erase(0,nl+1);
-            if(!line.empty()&&line.back()=='\r') {
-                line.pop_back();
-            }
-            if(line.empty()) {
-                continue;
-            }
-            vector<string> words;
-            stringstream ss(line);
+            if(!line.empty() && line.back()=='\r') line.pop_back();
+            if(line.empty()) continue;
+
+            vector<string> words; 
+            stringstream ss(line); 
             string w;
-            while(ss>>w){
-                words.push_back(w);
-            }
+            while(ss>>w) words.push_back(w);
             string reply;
-            if(words.size()==0){
-                reply="Empty command";
-                send_reply_with_marker(client_fd,reply);
-                continue;
+
+            if(words.size()==0){ 
+                send_reply_with_marker(client_fd,"Empty command"); 
+                continue; 
             }
 
-            // bool used_session=false;
-            if(words[0] == "session") {
-                if(words.size() < 4) {
-                    reply = "ERR usage: session <uid> <token> <command>";
-                    send_reply_with_marker(client_fd, reply);
+            // handle session reuse for failover
+            if(words[0]=="session"){
+                if(words.size()<4){ 
+                    reply="ERR usage: session <uid> <token> <command>"; 
+                    send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
-                string uid = words[1];
-                string token = words[2];
-                if(!set_session(uid, token, current_user, current_session)) {
-                    reply = "ERR invalid_session";
-                    send_reply_with_marker(client_fd, reply);
+                string uid=words[1], token=words[2];
+                if(!set_session(uid, token, current_user, current_session)){ 
+                    reply="ERR invalid_session"; 
+                    send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
-                words.erase(words.begin(), words.begin() + 3); // remaining command
+                words.erase(words.begin(), words.begin()+3);
             }
 
+            // ---------- handle commands like before ----------
             if(words[0]=="create_user"){
-                if(!current_user.empty()){
-                reply="ERR cannot_create_user_while_logged_in";
-                send_reply_with_marker(client_fd, reply);
-                continue;
-            }
-                if(words.size()!=3){
-                    reply="ERR usage: create_user <uid> <pw>";
-                    send_reply_with_marker(client_fd,reply);
+                if(!current_user.empty()){ 
+                    reply="ERR cannot_create_user_while_logged_in"; 
+                    send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
-                string uid=words[1],pw=words[2];
-                {
-                    lock_guard<mutex> lock(state_mutex);
-                    if(users.count(uid)){
-                        reply="User already exists";
-                        send_reply_with_marker(client_fd,reply);
+                if(words.size()!=3){ 
+                    reply="ERR usage: create_user <uid> <pw>"; 
+                    send_reply_with_marker(client_fd,reply); 
+                    continue;
+                }
+                string uid=words[1], pw=words[2];
+                { 
+                    lock_guard<mutex> lock(state_mutex); 
+                    if(users.count(uid)){ 
+                        reply="User already exists"; 
+                        send_reply_with_marker(client_fd,reply); 
                         continue;
-                    }
+                    } 
                 }
                 string op="CREATE_USER|"+uid+"|"+pw;
-                if(append_op_to_log(op)){
-                    // Do NOT call apply_op_line(op) here
-                    apply_op_line(op);
-                    reply="OK user_created";
-                }
-                else {
-                    reply="ERR log_append";
-                }
-                send_reply_with_marker(client_fd,reply);
+                if(append_op_to_log(op)){ 
+                    apply_op_line(op); 
+                    reply="OK user_created"; 
+                } 
+                else reply="ERR log_append";
+                send_reply_with_marker(client_fd,reply); 
                 continue;
             }
 
             if(words[0]=="login"){
-                if(!current_user.empty()){
-                    reply="ERR already_logged_in_on_this_client";
-                    send_reply_with_marker(client_fd, reply);
+                if(!current_user.empty()){ 
+                    reply="ERR already_logged_in_on_this_client"; 
+                    send_reply_with_marker(client_fd, reply); 
                     continue;
                 }
-                if(words.size()!=3){
-                    reply="ERR usage: login <uid> <pw>";
-                    send_reply_with_marker(client_fd,reply);
+                if(words.size()!=3){ 
+                    reply="ERR usage: login <uid> <pw>"; 
+                    send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
                 string uid=words[1], pw=words[2];
-                {
-                    lock_guard<mutex> lock(state_mutex);
-                    if(!users.count(uid) || users[uid].password!=pw){
-                        reply="ERR invalid_credentials";
-                        send_reply_with_marker(client_fd,reply);
+                { 
+                    lock_guard<mutex> lock(state_mutex); 
+                    if(!users.count(uid) || users[uid].password!=pw){ 
+                        reply="ERR invalid_credentials"; 
+                        send_reply_with_marker(client_fd,reply); 
                         continue;
                     }
-                    if(users[uid].loggedin){
-                        reply="ERR already_logged_in";
-                        send_reply_with_marker(client_fd,reply);
+                    if(users[uid].loggedin){ 
+                        reply="ERR already_logged_in"; 
+                        send_reply_with_marker(client_fd,reply); 
                         continue;
-                    }
+                    } 
                 }
-                string session_id = generate_session();  // you’ll need a helper for random session
+                string session_id = generate_session();
                 string op="LOGIN|"+uid+"|"+session_id;
-                if(append_op_to_log(op)){
-                    apply_op_line(op);
-                    reply="OK login_success"+session_id;
-                    current_user=uid;
-                    current_session=session_id;
-                }
-                else {
-                    reply="ERR log_append";
-                }
-                send_reply_with_marker(client_fd,reply);
+                if(append_op_to_log(op)){ 
+                    apply_op_line(op); 
+                    reply="OK login_success "+session_id; 
+                    current_user=uid; 
+                    current_session=session_id; 
+                } 
+                else reply="ERR log_append";
+                send_reply_with_marker(client_fd,reply); 
                 continue;
             }
 
-
             if(words[0]=="logout"){
-                if(current_user.empty()){
-                    reply="ERR not_logged_in";
-                    send_reply_with_marker(client_fd,reply);
+                if(current_user.empty()){ 
+                    reply="ERR not_logged_in"; 
+                    send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
                 string op="LOGOUT|"+current_user;
-                if(append_op_to_log(op)){
-                    apply_op_line(op);
-                    reply="OK logout_success";
-                    current_user="";
+                if(append_op_to_log(op)){ 
+                    apply_op_line(op); 
+                    reply="OK logout_success"; 
+                    current_user=""; 
                     current_session="";
-                }
-                else {
-                    reply="ERR log_append";
-                }
-                send_reply_with_marker(client_fd,reply);
+                } 
+                else reply="ERR log_append";
+                send_reply_with_marker(client_fd,reply); 
                 continue;
             }
-
 
             if(words[0]=="create_group"){
                 if(words.size()!=2){
