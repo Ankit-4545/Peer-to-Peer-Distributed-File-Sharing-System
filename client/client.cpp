@@ -20,7 +20,7 @@
 #include<fstream>
 
 const std::string UPLOADS_REGISTRY = ".uploads_registry";
-
+std::string cached_password="";
 #include "files.h"
 using namespace std;
 
@@ -225,35 +225,41 @@ bool send_command_noresp(string cmd) {
 }
 
 bool send_with_failover(string cmd) {
-    if(sock<0) {
-        if(!try_connect()) {
-            cout<<"No trackers available\n";
-            return false;
-        }
-    }
     string dummy;
-    if(!send_command(cmd,dummy)) {
-        cout<<"Trying next tracker\n";
-        int start=(current_tracker+1)%trackers.size();
-        int cnt=0;
-        while(cnt<trackers.size()) {
+    int attempts = 0;
+    int start = (current_tracker >= 0) ? current_tracker : 0;
+
+    while(attempts < trackers.size()) {
+        if(sock < 0) {
             int s = connect_to_tracker(start);
-            if(s>=0) {
-                // close old if any
-                if(sock>0 && sock!=s) close(sock);
+            if(s >= 0) {
                 sock = s;
-                cout<<"Connected to tracker "<<trackers[start].ip<<":"<<trackers[start].port<<"\n";
-                return send_command(cmd,dummy);
+                cout << "Connected to tracker " << trackers[start].ip << ":" << trackers[start].port << "\n";
+            } else {
+                // try next tracker
+                start = (start + 1) % trackers.size();
+                attempts++;
+                continue;
             }
-            start=(start+1)%trackers.size();
-            cnt++; // <<-- BUG FIX: increment cnt here (was missing before)
         }
-        cout<<"All trackers down\n";
-        return false;
+
+        if(send_command(cmd, dummy)) {
+            cout << dummy << "\n";
+            return true;
+        }
+
+        // command failed, try next tracker
+        cout << "Tracker " << trackers[start].ip << ":" << trackers[start].port << " failed, trying next tracker\n";
+        close(sock);
+        sock = -1;
+        start = (start + 1) % trackers.size();
+        attempts++;
     }
-    cout<<dummy<<"\n";
-    return true;
+
+    cout << "All trackers down\n";
+    return false;
 }
+
 
 string get_local_ip_from_socket(int s){
     sockaddr_in name;
@@ -411,11 +417,43 @@ int main(int argc,char *argv[]) {
                 cout<<"ERR already_logged_in_on_this_client\n";
                 continue;
             }
+
             string reply;
-            if(!send_command(cmd, reply)){
-                cout<<"Tracker request failed\n";
-                continue;
+
+            // <<< CHANGED: attempt failover for login itself
+            if(sock<0) {
+                if(!try_connect()) {
+                    cout << "Tracker request failed\n";
+                    continue;
+                }
             }
+
+            // <<< CHANGED: send login to tracker and retry if failover needed
+            if(!send_command(cmd, reply)) {
+                cout << "Tracker request failed, trying next tracker...\n";
+                int start = (current_tracker+1) % trackers.size();
+                int cnt = 0;
+                bool logged_in = false;
+                while(cnt < trackers.size()) {
+                    int s = connect_to_tracker(start);
+                    if(s >= 0) {
+                        if(sock>0 && sock!=s) close(sock);
+                        sock = s;
+                        cout<<"Connected to tracker "<<trackers[start].ip<<":"<<trackers[start].port<<"\n";
+                        if(send_command(cmd, reply)) {
+                            logged_in = true;
+                            break;
+                        }
+                    }
+                    start = (start+1)%trackers.size();
+                    cnt++;
+                }
+                if(!logged_in) {
+                    cout << "Tracker request failed\n";
+                    continue;
+                }
+            }
+
             // parse first line
             size_t posn = reply.find('\n');
             string firstline = (posn==string::npos)?reply:reply.substr(0,posn);
@@ -430,15 +468,12 @@ int main(int argc,char *argv[]) {
                         cached_session = token;
                         cout << firstline << "\n";
 
-                        // Ensure peer server is running so peer_listen_port is set
+                        // <<< CHANGED: Ensure peer server is running so peer_listen_port is set
                         if(!start_peer_server()) {
                             cout << "Warning: could not start peer server for re-announce\n";
                         }
 
-                        // compute local ip (may return 127.0.0.1 if control socket not bound)
-                        string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
-
-                        // >>> Proper re-announce: recompute file hashes and send full upload_file command
+                        // <<< CHANGED: Proper re-announce only for files uploaded by this user
                         auto records = load_upload_records();
                         for(auto &rec : records) {
                             string uid, gid, filename, filepath;
@@ -468,6 +503,7 @@ int main(int argc,char *argv[]) {
                                     cout << "[Auto-Reannounce] " << filename << " -> success\n";
                             }
                         }
+
                         continue;
                     }
                 }
@@ -480,6 +516,7 @@ int main(int argc,char *argv[]) {
                 continue;
             }
         }
+
 
 
         // Intercept logout to clear cached session on success
