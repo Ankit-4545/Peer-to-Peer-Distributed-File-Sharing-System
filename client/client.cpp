@@ -540,7 +540,6 @@ int main(int argc,char *argv[]) {
                 }
             }
 
-            // Parse tracker response
             stringstream ls(reply);
             string status; ls >> status;
             if(status != "OK") {
@@ -572,7 +571,6 @@ int main(int argc,char *argv[]) {
                 downloads[dkey] = ds;
             }
 
-            // Open file for writing
             int fd = open(fullpath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
             if(fd < 0) {
                 cout << "Cannot create file\n";
@@ -581,15 +579,19 @@ int main(int argc,char *argv[]) {
                 continue;
             }
 
-            // Lambda for a single piece download (with retries)
-            auto download_piece = [&](int pi) -> bool {
-                int max_retries = 5;
-                int retries = 0;
-                size_t expected_size = (pi == num_pieces-1) ? (filesize - pi*PIECE_SIZE) : PIECE_SIZE;
+            const int MAX_RETRIES = 5;
+            const int MAX_THREADS = 8; // parallel threads
 
-                while(retries < max_retries) {
-                    for(int sidx = 0; sidx < seeders.size(); sidx++) {
-                        string seeder = seeders[sidx];
+            atomic<int> pieces_done(0);
+            mutex fd_mutex;
+
+            auto download_piece = [&](int pi) -> bool {
+                size_t expected_size = PIECE_SIZE;
+                if ((off_t)pi * PIECE_SIZE + PIECE_SIZE > filesize)
+                    expected_size = filesize - (off_t)pi * PIECE_SIZE;
+
+                for(int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+                    for(const string &seeder : seeders) {
                         size_t ppos = seeder.find(':');
                         string sip = seeder.substr(0, ppos);
                         int sport = atoi(seeder.substr(ppos+1).c_str());
@@ -602,69 +604,76 @@ int main(int argc,char *argv[]) {
                         peeraddr.sin_family = AF_INET;
                         peeraddr.sin_port = htons(sport);
                         peeraddr.sin_addr.s_addr = inet_addr(sip.c_str());
+
+                        struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
+                        setsockopt(psock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
                         if(connect(psock,(sockaddr*)&peeraddr,sizeof(peeraddr))<0){
-                            close(psock); continue;
+                            close(psock);
+                            continue;
                         }
 
                         string req = "GET_PIECE " + filename + " " + to_string(pi) + "\n";
                         if(send(psock, req.c_str(), req.size(), 0) <= 0){
-                            close(psock); continue;
+                            close(psock);
+                            continue;
                         }
 
                         vector<char> pbuf(expected_size);
                         ssize_t total_rcv = 0;
-                        while(total_rcv < expected_size) {
-                            ssize_t rcv = recv(psock, pbuf.data()+total_rcv, expected_size-total_rcv,0);
-                            if(rcv <=0) break;
+                        while(total_rcv < expected_size){
+                            ssize_t rcv = recv(psock, pbuf.data() + total_rcv, expected_size - total_rcv, 0);
+                            if(rcv <= 0) break;
                             total_rcv += rcv;
                         }
                         close(psock);
 
-                        if(total_rcv != expected_size) continue;
+                        if((size_t)total_rcv != expected_size) continue;
                         if(sha1_hex((unsigned char*)pbuf.data(), pbuf.size()) != piece_hashes[pi]) continue;
 
-                        off_t off = (off_t)pi * PIECE_SIZE;
-                        if(lseek(fd, off, SEEK_SET) == (off_t)-1) return false;
-                        size_t wrote = 0;
-                        while(wrote < pbuf.size()){
-                            ssize_t w = write(fd, pbuf.data()+wrote, pbuf.size()-wrote);
-                            if(w <=0) break;
-                            wrote += w;
+                        {
+                            lock_guard<mutex> lg(fd_mutex);
+                            off_t off = (off_t)pi * PIECE_SIZE;
+                            if(lseek(fd, off, SEEK_SET) == (off_t)-1) return false;
+                            size_t wrote = 0;
+                            while(wrote < pbuf.size()){
+                                ssize_t w = write(fd, pbuf.data() + wrote, pbuf.size() - wrote);
+                                if(w <=0) break;
+                                wrote += w;
+                            }
                         }
+
                         {
                             lock_guard<mutex> lg(downloads_mutex);
                             downloads[dkey].have[pi] = pbuf.size();
                         }
-                        cout << "Downloaded piece " << pi+1 << "/" << num_pieces << "\n";
+
+                        int done = ++pieces_done;
+                        double perc = (double)done / num_pieces * 100.0;
+                        cout << "Piece " << pi+1 << "/" << num_pieces << " downloaded (" << (int)perc << "%)\n";
                         return true;
                     }
-                    retries++;
+                    this_thread::sleep_for(chrono::milliseconds(300));
                 }
+                cout << "Piece " << pi+1 << " failed after max retries\n";
                 return false;
             };
 
-            // Multi-threaded download
             vector<thread> workers;
             atomic<int> next_piece(0);
-            int max_threads = min(8, num_pieces); // max 8 threads
-
-            auto worker_func = [&]() {
+            auto worker = [&]() {
                 while(true) {
-                    int pi = next_piece.fetch_add(1);
+                    int pi = next_piece++;
                     if(pi >= num_pieces) break;
-                    if(!download_piece(pi)) {
-                        cout << "Failed piece " << pi << "\n";
-                    }
+                    download_piece(pi);
                 }
             };
 
-            for(int t=0; t<max_threads; t++)
-                workers.emplace_back(worker_func);
-            for(auto &th: workers) th.join();
+            for(int i=0;i<min(MAX_THREADS,num_pieces);i++) workers.emplace_back(worker);
+            for(auto &t : workers) t.join();
 
             close(fd);
 
-            // Final verification
             vector<string> ph_dummy;
             string fullh;
             uint64_t fs2;
@@ -677,6 +686,7 @@ int main(int argc,char *argv[]) {
             } else {
                 cout << "Final file hash mismatch\n";
             }
+
             continue;
         }
 
