@@ -17,6 +17,9 @@
 // #include<filesystem>
 #include <condition_variable>
 #include <sys/stat.h>
+#include<fstream>
+
+const std::string UPLOADS_REGISTRY = ".uploads_registry";
 
 #include "files.h"
 using namespace std;
@@ -52,6 +55,25 @@ struct DownloadStatus {
     bool completed;
 };
 map<string,DownloadStatus> downloads;
+
+void save_upload_record(const string &uid, const string &gid, const string &filename, const string &filepath) {
+    ofstream out(UPLOADS_REGISTRY, ios::app);
+    if(out.is_open()) {
+        out << uid << " " << gid << " " << filename << " " << filepath << "\n";
+    }
+}
+
+
+vector<tuple<string,string,string,string>> load_upload_records() {
+    vector<tuple<string,string,string,string>> records;
+    ifstream in(UPLOADS_REGISTRY);
+    string uid, gid, filename, filepath;
+    while(in >> uid >> gid >> filename >> filepath) {
+        records.emplace_back(uid, gid, filename, filepath);
+    }
+    return records;
+}
+
 
 void read_tracker_file(string filename) {
     int fd=open(filename.c_str(),O_RDONLY);
@@ -407,17 +429,58 @@ int main(int argc,char *argv[]) {
                         cached_uid = words[1];
                         cached_session = token;
                         cout << firstline << "\n";
+
+                        // Ensure peer server is running so peer_listen_port is set
+                        if(!start_peer_server()) {
+                            cout << "Warning: could not start peer server for re-announce\n";
+                        }
+
+                        // compute local ip (may return 127.0.0.1 if control socket not bound)
+                        string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
+
+                        // >>> Proper re-announce: recompute file hashes and send full upload_file command
+                        auto records = load_upload_records();
+                        for(auto &rec : records) {
+                            string uid, gid, filename, filepath;
+                            tie(uid, gid, filename, filepath) = rec;
+
+                            if(uid != cached_uid) continue;  // only re-announce files of logged-in user
+
+                            if(access(filepath.c_str(), F_OK) != -1) {
+                                // compute hashes and filesize
+                                vector<string> piece_hashes;
+                                string full_hash;
+                                uint64_t filesize = 0;
+                                if(!compute_file_hashes(filepath, piece_hashes, full_hash, filesize)) continue;
+
+                                string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
+                                if(!start_peer_server()) localip = "0.0.0.0";
+
+                                stringstream out;
+                                out << "upload_file " << gid << " " << filename << " "
+                                    << filesize << " " << localip << " " << peer_listen_port << " "
+                                    << full_hash << " " << piece_hashes.size();
+                                for(auto &ph : piece_hashes) out << " " << ph;
+
+                                if(!send_with_failover(out.str()))
+                                    cout << "[Auto-Reannounce] " << filename << " -> failed\n";
+                                else
+                                    cout << "[Auto-Reannounce] " << filename << " -> success\n";
+                            }
+                        }
                         continue;
                     }
                 }
                 // other OK responses
                 cout << firstline << "\n";
                 continue;
-            } else {
+            } 
+            else{
                 cout << firstline << "\n";
                 continue;
             }
         }
+
 
         // Intercept logout to clear cached session on success
         if(words[0] == "logout") {
@@ -439,7 +502,7 @@ int main(int argc,char *argv[]) {
 
         // dispatch certain commands client-side
         if(words[0] == "upload_file") {
-    // Expected: upload_file <gid> <file_path_or_name>
+            // Expected: upload_file <gid> <file_path_or_name>
             if(words.size() != 3) {
                 cout << "ERR usage: upload_file <gid> <file_path>\n";
                 continue;
@@ -480,9 +543,13 @@ int main(int argc,char *argv[]) {
             for(auto &ph : piece_hashes) out << " " << ph;
 
             // --- Send with automatic failover ---
-            if(!send_with_failover(out.str())) cout << "ERR upload_failed\n";
-            else cout << "Upload registered\n";
-
+            if(!send_with_failover(out.str())) {
+                cout << "ERR upload_failed\n";
+            }
+            else {
+                cout << "Upload registered\n";
+                save_upload_record(cached_uid,gid,filename,filepath);
+            }
             continue;
         }
 
