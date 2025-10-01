@@ -211,7 +211,7 @@ void replay_log_full(){
     off_t off=lseek(fd,0,SEEK_END);
     last_offset=(off<0)?0:off;
     close(fd);
-    lock_guard<mutex>lock(state_mutex);
+    // lock_guard<mutex>lock(state_mutex);
     for (auto &kv:users){
         kv.second.loggedin=false;
         kv.second.session="";
@@ -281,6 +281,12 @@ string generate_session(){
 void handle_client(int client_fd){
     string current_user, 
     current_session;
+    sockaddr_in addr;
+    socklen_t len = sizeof(addr);
+    getpeername(client_fd, (sockaddr*)&addr, &len);
+    string peer_ip = inet_ntoa(addr.sin_addr);
+    int peer_port = ntohs(addr.sin_port);
+    string peer = peer_ip + ":" + to_string(peer_port);
     const int BUF=4096; 
     char buf[BUF]; 
     string acc;
@@ -597,54 +603,83 @@ void handle_client(int client_fd){
             }
 
             // Now handle upload_file/list_files/download_file/stop_share concretely
-            if(words[0]=="upload_file"){
-                if(words.size()!=3){
-                    reply="ERR usage: upload_file <gid> <filename>";
-                    send_reply_with_marker(client_fd,reply);
+            if(words[0] == "upload_file") {
+                // Minimum expected: upload_file <gid> <filename> <filesize> <peer_ip> <peer_port> <full_hash> <num_pieces> <piece_hashes...>
+                if(words.size() < 8) {
+                    reply = "ERR usage: upload_file <gid> <filename> <filesize> <peer_ip> <peer_port> <full_hash> <num_pieces> <piece_hashes...>";
+                    send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-                if(current_user.empty()){
-                    reply="You must login first";
-                    send_reply_with_marker(client_fd,reply);
+
+                if(current_user.empty()) {
+                    reply = "ERR you_must_login_first";
+                    send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-                string gid=words[1], fname=words[2];
+
+                string gid = words[1];
+                string filename = words[2];
+                uint64_t filesize = stoull(words[3]);
+                string peer_ip = words[4];
+                int peer_port = stoi(words[5]);
+                string full_hash = words[6];
+                int num_pieces = stoi(words[7]);
+
+                if(words.size() != 8 + num_pieces) {
+                    reply = "ERR mismatch_num_pieces";
+                    send_reply_with_marker(client_fd, reply);
+                    continue;
+                }
+
+                vector<string> piece_hashes;
+                for(int i = 0; i < num_pieces; i++) {
+                    piece_hashes.push_back(words[8 + i]);
+                }
+
+                // Validate group membership
                 {
                     lock_guard<mutex> lock(state_mutex);
-                    if(!groups.count(gid)){
-                        reply="ERR no_such_group";
-                        send_reply_with_marker(client_fd,reply);
+                    if(!groups.count(gid)) {
+                        reply = "ERR no_such_group";
+                        send_reply_with_marker(client_fd, reply);
                         continue;
                     }
-                    if(find(groups[gid].members.begin(), groups[gid].members.end(), current_user)==groups[gid].members.end()){
-                        reply="ERR not_member";
-                        send_reply_with_marker(client_fd,reply);
+                    auto &members = groups[gid].members;
+                    if(find(members.begin(), members.end(), current_user) == members.end()) {
+                        reply = "ERR not_member";
+                        send_reply_with_marker(client_fd, reply);
                         continue;
                     }
                 }
-                string op="UPLOAD_FILE|"+gid+"|"+fname+"|"+current_user;
-                if(append_op_to_log(op)){
+
+                // Construct log entry using all client-provided metadata
+                string peer = peer_ip + ":" + to_string(peer_port);
+                string op = "UPLOAD_FILE|" + gid + "|" + filename + "|" + to_string(filesize) + "|" + peer + "|" 
+                            + full_hash + "|" + join_piece_hashes(piece_hashes);
+
+                if(append_op_to_log(op)) {
                     apply_op_line(op);
-                    reply="OK file_uploaded";
+                    reply = "OK file_uploaded";
+                } else {
+                    reply = "ERR log_append";
                 }
-                else {
-                    reply="ERR log_append";
-                }
-                send_reply_with_marker(client_fd,reply);
+
+                send_reply_with_marker(client_fd, reply);
                 continue;
             }
-
 
             if(words[0]=="list_files"){
                 if(words.size()!=2){
                     reply="ERR usage: list_files <gid>";
-                    send_reply_with_marker(client_fd,reply);continue;
+                    send_reply_with_marker(client_fd,reply);
+                    continue;
                 }
                 string gid=words[1];
                 lock_guard<mutex> lock(state_mutex);
                 if(!group_files.count(gid)){
                     reply="No files\n";
-                    send_reply_with_marker(client_fd,reply);continue;
+                    send_reply_with_marker(client_fd,reply);
+                    continue;
                 }
                 string out;
                 for(auto &p:group_files[gid]){
@@ -656,49 +691,74 @@ void handle_client(int client_fd){
                 continue;
             }
 
-            if(words[0]=="download_file"){
-                if(words.size()!=3){
-                    reply="Invalid argument";
-                    send_reply_with_marker(client_fd,reply);
+
+            if(words[0] == "download_file") {
+                // Expected: download_file <gid> <filename>
+                if(words.size() != 3) {
+                    reply = "ERR usage: download_file <gid> <filename>";
+                    send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-                string gid=words[1],filename=words[2];
+
+                string gid = words[1];
+                string filename = words[2];
+
                 lock_guard<mutex> lock(state_mutex);
-                if(!group_files.count(gid) || !group_files[gid].count(filename)){
-                    reply="No such file";
-                    send_reply_with_marker(client_fd,reply);
+
+                // Check if file exists in the group
+                if(!group_files.count(gid) || !group_files[gid].count(filename)) {
+                    reply = "ERR no_such_file";
+                    send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-                FileMeta &fm=group_files[gid][filename];
+
+                FileMeta &fm = group_files[gid][filename];
+
+                // Build response
                 std::ostringstream oss;
-                oss<<"OK "<<fm.filesize<<" "<<fm.filehash<<" "<<fm.piece_hashes.size();
-                for(auto &ph:fm.piece_hashes) oss<<" "<<ph;
-                oss<<" "<<fm.seeders.size();
-                for(auto &s:fm.seeders) oss<<" "<<s;
-                reply=oss.str();
-                send_reply_with_marker(client_fd,reply);
+                oss << "OK " 
+                    << fm.filesize << " "
+                    << fm.filehash << " "
+                    << fm.piece_hashes.size();
+
+                // Append piece hashes
+                for(const auto &ph : fm.piece_hashes) oss << " " << ph;
+
+                // Prepare seeder list, excluding requesting peer
+                vector<string> filtered_seeders;
+                for(const auto &s : fm.seeders) {
+                    if(s != peer) filtered_seeders.push_back(s);
+                }
+
+                oss << " " << filtered_seeders.size();
+                for(const auto &s : filtered_seeders) oss << " " << s;
+
+                // Note: Tracker does not use destination path; client handles local saving
+                reply = oss.str();
+                send_reply_with_marker(client_fd, reply);
                 continue;
             }
 
+
             if(words[0]=="stop_share"){
-                // expect: stop_share <gid> <filename> <peerip> <peerport>
-                if(words.size()!=5){
-                    reply="ERR usage: stop_share <gid> <filename> <peerip> <peerport>";
-                    send_reply_with_marker(client_fd,reply);continue;
+                // Expected: stop_share <gid> <filename>
+                if(words.size()!=3){
+                    reply="ERR usage: stop_share <gid> <filename>";
+                    send_reply_with_marker(client_fd,reply);
+                    continue;
                 }
-                string gid=words[1],filename=words[2],peerip=words[3],peerport=words[4];
-                string peer=peerip+":"+peerport;
-                string op="STOP_SHARE|"+gid+"|"+filename+"|"+peer;
+                string gid=words[1], filename=words[2];
+
+                string op = "STOP_SHARE|" + gid + "|" + filename + "|" + peer;
                 if(append_op_to_log(op)){
                     apply_op_line(op);
                     reply="OK stopped";
-                } else reply="ERR log_append";
+                } else {
+                    reply="ERR log_append";
+                }
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
-
-            reply="ERR unknown_command";
-            send_reply_with_marker(client_fd,reply);
         }
     }
     close(client_fd);

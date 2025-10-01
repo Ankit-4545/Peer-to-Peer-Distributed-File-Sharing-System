@@ -14,11 +14,11 @@
 #include <cstring>
 #include <cstdlib>
 #include <map>
+// #include<filesystem>
 #include <condition_variable>
 #include <sys/stat.h>
 
 #include "files.h"
-
 using namespace std;
 
 struct Tracker {
@@ -438,32 +438,51 @@ int main(int argc,char *argv[]) {
         }
 
         // dispatch certain commands client-side
-        if(words[0]=="upload_file"){
-            if(words.size()!=3){
-                cout<<"Usage: upload_file <gid> <file_path>\n";
+        if(words[0] == "upload_file") {
+    // Expected: upload_file <gid> <file_path_or_name>
+            if(words.size() != 3) {
+                cout << "ERR usage: upload_file <gid> <file_path>\n";
                 continue;
             }
-            string gid=words[1];
-            string path=words[2];
+
+            string gid = words[1];
+            string filepath = words[2];
+
+            // --- Compute hashes and file size ---
             vector<string> piece_hashes;
-            string filehash;
-            uint64_t filesize=0;
-            if(!compute_file_hashes(path,piece_hashes,filehash,filesize)){
-                cout<<"Error computing file hashes or opening file\n";
+            string full_hash;
+            uint64_t filesize = 0;
+            if(!compute_file_hashes(filepath, piece_hashes, full_hash, filesize)) {
+                cout << "ERR cannot_open_file\n";
                 continue;
             }
-            if(!start_peer_server()){
-                cout<<"Cannot start peer server\n";
+
+            // --- Extract filename only ---
+            string filename;
+            size_t pos = filepath.find_last_of("/\\");
+            if(pos != string::npos) filename = filepath.substr(pos + 1);
+            else filename = filepath;  // just name
+
+            // --- Ensure peer server is running ---
+            if(!start_peer_server()) {
+                cout << "ERR cannot_start_peer_server\n";
                 continue;
             }
-            string localip=get_local_ip_from_socket(sock>=0?sock:0);
+
+            string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
+
+            // --- Prepare full command to tracker ---
             stringstream out;
-            // NOTE: protocol mismatch exists between client and tracker for upload_file details.
-            // Keep current format (the server expects different format in apply_op_line). We'll send metadata and let server ignore extras for now.
-            out<<"upload_file "<<gid<<" "<<path<<" "<<to_string(filesize)<<" "<<localip<<" "<<to_string(peer_listen_port)<<" "<<filehash<<" "<<piece_hashes.size();
-            for(auto &ph:piece_hashes) out<<" "<<ph;
-            if(!send_with_failover(out.str())) cout<<"upload failed\n";
-            else cout<<"upload registered\n";
+            out << "upload_file " << gid << " " << filename << " " 
+                << filesize << " " << localip << " " << peer_listen_port << " " 
+                << full_hash << " " << piece_hashes.size();
+
+            for(auto &ph : piece_hashes) out << " " << ph;
+
+            // --- Send with automatic failover ---
+            if(!send_with_failover(out.str())) cout << "ERR upload_failed\n";
+            else cout << "Upload registered\n";
+
             continue;
         }
 
@@ -476,141 +495,187 @@ int main(int argc,char *argv[]) {
             continue;
         }
 
-        if(words[0]=="download_file"){
-            if(words.size()!=4){
-                cout<<"Invalid arguments\n";
+        if(words[0] == "download_file") {
+            if(words.size() != 4) {
+                cout << "ERR usage: download_file <gid> <filename> <destination_folder>\n";
                 continue;
             }
-            string gid=words[1],filename=words[2],dest=words[3];
-            string ask="download_file "+gid+" "+filename;
+
+            string gid = words[1];
+            string filename = words[2];
+            string dest_folder = words[3];
+            if(dest_folder.back() != '/' && dest_folder.back() != '\\') dest_folder += "/";
+
+            auto create_dir_recursive = [](const string &path) -> bool {
+                if(path.empty()) return false;
+                char tmp[1024];
+                strncpy(tmp, path.c_str(), sizeof(tmp));
+                tmp[sizeof(tmp)-1] = 0;
+                for(char *p = tmp + 1; *p; p++) {
+                    if(*p == '/' || *p == '\\') {
+                        *p = 0;
+                        if(mkdir(tmp, 0755) != 0 && errno != EEXIST) return false;
+                        *p = '/';
+                    }
+                }
+                if(mkdir(tmp, 0755) != 0 && errno != EEXIST) return false;
+                return true;
+            };
+
+            if(!create_dir_recursive(dest_folder)) {
+                cout << "ERR cannot_create_folder\n";
+                continue;
+            }
+
+            string fullpath = dest_folder + filename;
+
+            // Request file info from tracker
+            string ask = "download_file " + gid + " " + filename;
             string reply;
-            if(!send_command(ask,reply)){ 
-                cout<<"Tracker request failed\n"; 
-                continue; 
+            if(!send_command(ask, reply)) {
+                cout << "Tracker request failed\n";
+                if(!try_connect() || !send_command(ask, reply)) {
+                    cout << "All trackers unavailable\n";
+                    continue;
+                }
             }
-            // parse first line
-            size_t posn=reply.find('\n');
-            string firstline=(posn==string::npos)?reply:reply.substr(0,posn);
-            if(firstline.rfind("ERR",0)==0){ 
-                cout<<firstline<<"\n"; 
-                continue; 
+
+            // Parse tracker response
+            stringstream ls(reply);
+            string status; ls >> status;
+            if(status != "OK") {
+                cout << reply << "\n";
+                continue;
             }
-            if(firstline.rfind("OK",0)!=0){ 
-                cout<<firstline<<"\n"; 
-                continue; 
-            }
-            stringstream ls(firstline);
-            string ok; 
-            ls>>ok;
-            uint64_t filesize; 
-            ls>>filesize;
-            string filehash; 
-            ls>>filehash;
-            int num_pieces; 
-            ls>>num_pieces;
-            vector<string>piece_hashes;
-            for(int i=0;i<num_pieces;i++){ 
-                string ph; 
-                ls>>ph; 
-                piece_hashes.push_back(ph); 
-            }
-            int num_seeders; 
-            ls>>num_seeders;
-            vector<string> seeders;
-            for(int i=0;i<num_seeders;i++){ 
-                string s; 
-                ls>>s; 
-                seeders.push_back(s); 
-            }
-            if(seeders.empty()){ 
-                cout<<"No seeders\n"; 
-                continue; 
-            }
+
+            uint64_t filesize; ls >> filesize;
+            string filehash; ls >> filehash;
+            int num_pieces; ls >> num_pieces;
+            vector<string> piece_hashes(num_pieces);
+            for(int i=0; i<num_pieces; i++) ls >> piece_hashes[i];
+            int num_seeders; ls >> num_seeders;
+            if(num_seeders <= 0) { cout << "No seeders\n"; continue; }
+            vector<string> seeders(num_seeders);
+            for(int i=0;i<num_seeders;i++) ls >> seeders[i];
+
+            // Initialize download status
             DownloadStatus ds;
-            ds.gid=gid; 
-            ds.filename=dest; 
-            ds.filesize=filesize; 
-            ds.num_pieces=num_pieces; 
-            ds.have.assign(num_pieces,0); 
-            ds.completed=false;
-            string dkey=gid+":"+filename;
+            ds.gid = gid;
+            ds.filename = fullpath;
+            ds.filesize = filesize;
+            ds.num_pieces = num_pieces;
+            ds.have.assign(num_pieces, 0);
+            ds.completed = false;
+            string dkey = gid + ":" + filename;
             {
                 lock_guard<mutex> lg(downloads_mutex);
-                downloads[dkey]=ds;
+                downloads[dkey] = ds;
             }
-            string first_seeder=seeders[0];
-            size_t ppos=first_seeder.find(':');
-            string sip=first_seeder.substr(0,ppos);
-            int sport=atoi(first_seeder.substr(ppos+1).c_str());
-            int fd=open(dest.c_str(),O_CREAT|O_WRONLY|O_TRUNC,0644);
-            if(fd<0){ 
-                cout<<"Cannot create file\n"; 
-                lock_guard<mutex> lg(downloads_mutex); 
-                downloads.erase(dkey); 
-                continue; 
+
+            // Open file for writing
+            int fd = open(fullpath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+            if(fd < 0) {
+                cout << "Cannot create file\n";
+                lock_guard<mutex> lg(downloads_mutex);
+                downloads.erase(dkey);
+                continue;
             }
-            for(int pi=0;pi<num_pieces;pi++){
-                int psock=socket(AF_INET,SOCK_STREAM,0);
-                if(psock<0) break;
-                sockaddr_in peeraddr; 
-                memset(&peeraddr,0,sizeof(peeraddr));
-                peeraddr.sin_family=AF_INET; 
-                peeraddr.sin_port=htons(sport);
-                peeraddr.sin_addr.s_addr=inet_addr(sip.c_str());
-                if(connect(psock,(sockaddr*)&peeraddr,sizeof(peeraddr))<0){ 
-                    close(psock); 
-                    break; 
+
+            // Lambda for a single piece download (with retries)
+            auto download_piece = [&](int pi) -> bool {
+                int max_retries = 5;
+                int retries = 0;
+                size_t expected_size = (pi == num_pieces-1) ? (filesize - pi*PIECE_SIZE) : PIECE_SIZE;
+
+                while(retries < max_retries) {
+                    for(int sidx = 0; sidx < seeders.size(); sidx++) {
+                        string seeder = seeders[sidx];
+                        size_t ppos = seeder.find(':');
+                        string sip = seeder.substr(0, ppos);
+                        int sport = atoi(seeder.substr(ppos+1).c_str());
+
+                        int psock = socket(AF_INET, SOCK_STREAM, 0);
+                        if(psock < 0) continue;
+
+                        sockaddr_in peeraddr;
+                        memset(&peeraddr,0,sizeof(peeraddr));
+                        peeraddr.sin_family = AF_INET;
+                        peeraddr.sin_port = htons(sport);
+                        peeraddr.sin_addr.s_addr = inet_addr(sip.c_str());
+                        if(connect(psock,(sockaddr*)&peeraddr,sizeof(peeraddr))<0){
+                            close(psock); continue;
+                        }
+
+                        string req = "GET_PIECE " + filename + " " + to_string(pi) + "\n";
+                        if(send(psock, req.c_str(), req.size(), 0) <= 0){
+                            close(psock); continue;
+                        }
+
+                        vector<char> pbuf(expected_size);
+                        ssize_t total_rcv = 0;
+                        while(total_rcv < expected_size) {
+                            ssize_t rcv = recv(psock, pbuf.data()+total_rcv, expected_size-total_rcv,0);
+                            if(rcv <=0) break;
+                            total_rcv += rcv;
+                        }
+                        close(psock);
+
+                        if(total_rcv != expected_size) continue;
+                        if(sha1_hex((unsigned char*)pbuf.data(), pbuf.size()) != piece_hashes[pi]) continue;
+
+                        off_t off = (off_t)pi * PIECE_SIZE;
+                        if(lseek(fd, off, SEEK_SET) == (off_t)-1) return false;
+                        size_t wrote = 0;
+                        while(wrote < pbuf.size()){
+                            ssize_t w = write(fd, pbuf.data()+wrote, pbuf.size()-wrote);
+                            if(w <=0) break;
+                            wrote += w;
+                        }
+                        {
+                            lock_guard<mutex> lg(downloads_mutex);
+                            downloads[dkey].have[pi] = pbuf.size();
+                        }
+                        cout << "Downloaded piece " << pi+1 << "/" << num_pieces << "\n";
+                        return true;
+                    }
+                    retries++;
                 }
-                string req="GET_PIECE "+filename+" "+to_string(pi)+"\n";
-                if(send(psock,req.c_str(),req.size(),0)<=0){ 
-                    close(psock); 
-                    break; 
+                return false;
+            };
+
+            // Multi-threaded download
+            vector<thread> workers;
+            atomic<int> next_piece(0);
+            int max_threads = min(8, num_pieces); // max 8 threads
+
+            auto worker_func = [&]() {
+                while(true) {
+                    int pi = next_piece.fetch_add(1);
+                    if(pi >= num_pieces) break;
+                    if(!download_piece(pi)) {
+                        cout << "Failed piece " << pi << "\n";
+                    }
                 }
-                // size_t want=PIECE_SIZE;
-                vector<char> pbuf;
-                char recvbuf[8192];
-                ssize_t rcv;
-                while((rcv=recv(psock,recvbuf,sizeof(recvbuf),0))>0){
-                    pbuf.insert(pbuf.end(),recvbuf,recvbuf+rcv);
-                }
-                close(psock);
-                if(pbuf.empty()){ cout<<"Failed to get piece "<<pi<<"\n"; break; }
-                string ph=sha1_hex((const unsigned char*)pbuf.data(),pbuf.size());
-                if(ph!=piece_hashes[pi]){
-                    cout<<"Hash mismatch for piece "<<pi<<"\n"; 
-                    break; 
-                }
-                off_t off=(off_t)pi*(off_t)PIECE_SIZE;
-                if(lseek(fd,off,SEEK_SET)==(off_t)-1){ 
-                    cout<<"Seek error\n"; 
-                    break; 
-                }
-                size_t wrote=0;
-                while(wrote<pbuf.size()){
-                    ssize_t w=write(fd,pbuf.data()+wrote,pbuf.size()-wrote);
-                    if(w<=0) break;
-                    wrote+=w;
-                }
-                {
-                    lock_guard<mutex> lg(downloads_mutex);
-                    downloads[dkey].have[pi]=pbuf.size();
-                }
-            }
+            };
+
+            for(int t=0; t<max_threads; t++)
+                workers.emplace_back(worker_func);
+            for(auto &th: workers) th.join();
+
             close(fd);
-            vector<string> ph_dummy; 
-            string fullh; uint64_t fs2;
-            if(!compute_file_hashes(dest,ph_dummy,fullh,fs2)){
-                cout<<"Downloaded but cannot compute final hash\n";
-            } 
-            else{
-                if(fullh==filehash){
-                    cout<<"Download completed and verified\n";
-                    lock_guard<mutex> lg(downloads_mutex);
-                    downloads[dkey].completed=true;
-                } 
-                else{
-                    cout<<"Final file hash mismatch\n";
-                }
+
+            // Final verification
+            vector<string> ph_dummy;
+            string fullh;
+            uint64_t fs2;
+            if(!compute_file_hashes(fullpath, ph_dummy, fullh, fs2)){
+                cout << "Downloaded but cannot compute final hash\n";
+            } else if(fullh == filehash){
+                cout << "Download completed and verified\n";
+                lock_guard<mutex> lg(downloads_mutex);
+                downloads[dkey].completed = true;
+            } else {
+                cout << "Final file hash mismatch\n";
             }
             continue;
         }
@@ -645,7 +710,6 @@ int main(int argc,char *argv[]) {
             send_with_failover(cmdline);
             continue;
         }
-
         // default: send raw to tracker (send_with_failover will apply session wrapper)
         send_with_failover(cmd);
     }
