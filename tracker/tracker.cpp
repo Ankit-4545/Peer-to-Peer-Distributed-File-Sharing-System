@@ -202,7 +202,6 @@ void replay_log_full(){
     off_t off=lseek(fd,0,SEEK_END);
     last_offset=(off<0)?0:off;
     close(fd);
-    // lock_guard<mutex>lock(state_mutex);
     for (auto &kv:users){
         kv.second.loggedin=false;
         kv.second.session="";
@@ -481,7 +480,7 @@ void handle_client(int client_fd){
                 {
                     lock_guard<mutex> lock(state_mutex);
                     if(!groups.count(gid)){
-                        reply="ERR no_such_group";
+                        reply="no_such_group";
                         send_reply_with_marker(client_fd,reply);
                         continue;
                     }
@@ -574,9 +573,7 @@ void handle_client(int client_fd){
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
-            // Now handle upload_file/list_files/download_file/stop_share concretely
             if(words[0] == "upload_file") {
-                // Minimum expected: upload_file <gid> <filename> <filesize> <peer_ip> <peer_port> <full_hash> <num_pieces> <piece_hashes...>
                 if(words.size() < 8) {
                     reply = "Invalid arguments for upload file";
                     send_reply_with_marker(client_fd, reply);
@@ -618,7 +615,6 @@ void handle_client(int client_fd){
                         continue;
                     }
                 }
-                // Construct log entry using all client-provided metadata
                 string peer = peer_ip + ":" + to_string(peer_port);
                 string op = "UPLOAD_FILE|" + gid + "|" +filename + "|" +to_string(filesize)+"|" +peer + "|" 
                             + full_hash + "|" +join_piece_hashes(piece_hashes);
@@ -655,7 +651,6 @@ void handle_client(int client_fd){
                 continue;
             }
             if(words[0] == "download_file") {
-                // Expected: download_file <gid> <filename>
                 if(words.size() != 3) {
                     reply = "invalid command for download";
                     send_reply_with_marker(client_fd, reply);
@@ -664,35 +659,29 @@ void handle_client(int client_fd){
                 string gid=words[1];
                 string filename=words[2];
                 lock_guard<mutex>lock(state_mutex);
-                // Check if file exists in the group
                 if(!group_files.count(gid) || !group_files[gid].count(filename)) {
                     reply = "no_such_file in the group";
                     send_reply_with_marker(client_fd, reply);
                     continue;
                 }
                 FileMeta &fm =group_files[gid][filename];
-                // Build response
                 std::ostringstream oss;
                 oss << "OK " 
                     <<fm.filesize << " "
                     <<fm.filehash << " "
                     <<fm.piece_hashes.size();
-                // Append piece hashes
                 for(const auto &ph:fm.piece_hashes)oss<<" "<<ph;
-                // Prepare seeder list excluding requesting peer
                 vector<string> filtered_seeders;
                 for(const auto &s : fm.seeders) {
                     if(s != peer)filtered_seeders.push_back(s);
                 }
                 oss << " " << filtered_seeders.size();
                 for(const auto &s :filtered_seeders) oss<<" "<<s;
-                // Note: Tracker does not use destination path; client handles local saving
                 reply=oss.str();
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
             if(words[0]=="stop_share"){
-                // Expected: stop_share <gid> <filename>
                 if(words.size()!=5){
                     reply="Invaid arguments for stop_share";
                     send_reply_with_marker(client_fd,reply);

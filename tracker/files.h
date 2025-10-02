@@ -8,7 +8,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-static const size_t PIECE_SIZE = 512*1024; // 512KB
+static const size_t PIECE_SIZE = 512*1024; 
 
 struct FileMeta {
     std::string filename;
@@ -25,4 +25,4 @@ ssize_t read_piece_from_file(const std::string &path,size_t piece_index,char *bu
 std::string join_piece_hashes(const std::vector<std::string> &v);
 std::vector<std::string> split_piece_hashes(const std::string &s);
 
-#endif // FILES_H
+#endif 

@@ -37,8 +37,8 @@ vector<Tracker> trackers;
 int current_tracker=-1;
 int sock=-1;
 mutex sock_lock;
-string cached_uid="";            // stored after login
-string cached_session="";        // stored session token
+string cached_uid="";           
+string cached_session="";       
 int peer_listen_fd=-1;
 int peer_listen_port=0;
 thread peer_thread;
@@ -143,7 +143,7 @@ string first_word(const string &cmd) {
     return w;
 }
 
-//send command wraps the session if cached reads until END_OF_REPLY
+//send command wraps the session if cached reads until end of reply
 bool send_command(string cmd,string &response) {
     lock_guard<mutex>lg(sock_lock);
     if(sock<0) {
@@ -164,7 +164,7 @@ bool send_command(string cmd,string &response) {
         sock = -1;
         return false;
     }
-    // read until "END_OF_REPLY"
+    // read until end of reply
     string acc;
     const int BUF = 8192;
     char buffer[BUF];
@@ -516,7 +516,7 @@ int main(int argc,char *argv[]) {
                         for(auto &rec : records){
                             string uid, gid, filename, filepath;
                             tie(uid, gid, filename,filepath) = rec;
-                            if(uid != cached_uid)continue;  // only re-announce files of logged-in user
+                            if(uid != cached_uid)continue;  
                             if(announced.count({gid, filename})) continue;
                             announced.insert({gid, filename});   
                             if(access(filepath.c_str(), F_OK) != -1) {
@@ -682,7 +682,7 @@ int main(int argc,char *argv[]) {
             string full_hash;
             uint64_t filesize = 0;
             if(!compute_file_hashes(filepath, piece_hashes, full_hash, filesize)) {
-                cout << "ERR cannot_open_file\n";
+                cout << "cannot_open_file\n";
                 continue;
             }
             string filename;
@@ -802,7 +802,7 @@ int main(int argc,char *argv[]) {
                 continue;
             }
             const int MAX_RETRIES = 5;
-            const int MAX_THREADS = 8; // parallel threads
+            const int MAX_THREADS = 8; 
             atomic<int> pieces_done(0);
             mutex fd_mutex;
             auto download_piece = [&](int pi) -> bool {
