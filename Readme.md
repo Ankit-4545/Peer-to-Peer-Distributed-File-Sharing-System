@@ -56,6 +56,10 @@ Pieces can be independently read from disk using read_piece_from_file, supportin
 ### Integrity Verification and P2P Strategy:
 Each downloaded piece is verified against its hash, and the complete file is checked against the full-file hash. This allows safe, parallel downloads from multiple seeders, with retries for failed pieces, ensuring robust file sharing with full integrity guarantees.
 
+### Assumption made
+* Both tracker is up at the start.
+* If a tracker goes down it wont come up in the current session.
+
 ## Execution instruction:
 1. For tracker:
 * cd tracker

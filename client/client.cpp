@@ -855,12 +855,12 @@ int main(int argc,char *argv[]) {
                         }
                         int done = ++pieces_done;
                         double perc = (double)done / num_pieces * 100.0;
-                        cout << "\rPiece " << pi+1 << "/" << num_pieces << " downloaded (" << (int)perc << "%)"<<flush;
+                        cout << "\rDownloaded " << done << "/" << num_pieces << " pieces (" << (int)perc << "%)"<<flush;
                         return true;
                     }
                     this_thread::sleep_for(chrono::milliseconds(300));
                 }
-                cout << "Piece " << pi+1 << " failed after max retries\n";
+                cout << "\nPiece " << pi+1 << " failed after max retries"<<endl;
                 return false;
             };
             vector<thread> workers;
@@ -874,6 +874,7 @@ int main(int argc,char *argv[]) {
             };
             for(int i=0;i<min(MAX_THREADS,num_pieces);i++) workers.emplace_back(worker);
             for(auto &t : workers) t.join();
+            cout<<endl;
             close(fd);
             vector<string> ph_dummy;
             string fullh;
