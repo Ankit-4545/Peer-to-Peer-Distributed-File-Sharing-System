@@ -217,7 +217,6 @@ bool send_with_failover(const string &cmd, string &out_reply, bool is_login = fa
     out_reply.clear();
     int attempts = 0;
     int start = (current_tracker >= 0) ? current_tracker : 0;
-    int tried = 0;
     while(attempts < trackers.size()) {
         if(sock < 0) {
             int s = connect_to_tracker(start);
@@ -856,7 +855,7 @@ int main(int argc,char *argv[]) {
                         }
                         int done = ++pieces_done;
                         double perc = (double)done / num_pieces * 100.0;
-                        cout << "Piece " << pi+1 << "/" << num_pieces << " downloaded (" << (int)perc << "%)\n";
+                        cout << "\rPiece " << pi+1 << "/" << num_pieces << " downloaded (" << (int)perc << "%)"<<flush;
                         return true;
                     }
                     this_thread::sleep_for(chrono::milliseconds(300));
