@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <condition_variable>
 #include <sys/stat.h>
 #include<fstream>
@@ -511,10 +512,13 @@ int main(int argc,char *argv[]) {
                         }
                         //re-announce only for files uploaded by this user
                         auto records = load_upload_records();
+                        set<pair<string,std::string>> announced;
                         for(auto &rec : records){
                             string uid, gid, filename, filepath;
                             tie(uid, gid, filename,filepath) = rec;
                             if(uid != cached_uid)continue;  // only re-announce files of logged-in user
+                            if(announced.count({gid, filename})) continue;
+                            announced.insert({gid, filename});   
                             if(access(filepath.c_str(), F_OK) != -1) {
                                 // compute hashes and filesize
                                 vector<string> piece_hashes;
