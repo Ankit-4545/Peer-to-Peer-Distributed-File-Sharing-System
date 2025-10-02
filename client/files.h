@@ -7,22 +7,23 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+using namespace std;
 
 static const size_t PIECE_SIZE = 512*1024; 
 
 struct FileMeta {
-    std::string filename;
+    string filename;
     uint64_t filesize;
-    std::string filehash;
-    std::vector<std::string> piece_hashes;
-    std::vector<std::string> seeders;
+    string filehash;
+    vector<string> piece_hashes;
+    vector<string> seeders;
 };
 
-std::string sha1_hex(const unsigned char *data,size_t len);
-std::string sha1_hex(const std::string &s);
-bool compute_file_hashes(const std::string &path, std::vector<std::string> &piece_hashes, std::string &full_hash, uint64_t &filesize);
-ssize_t read_piece_from_file(const std::string &path,size_t piece_index,char *buf,size_t bufsize);
-std::string join_piece_hashes(const std::vector<std::string> &v);
-std::vector<std::string> split_piece_hashes(const std::string &s);
+string sha1_hex(const unsigned char *data,size_t len);
+string sha1_hex(const string &s);
+bool compute_file_hashes(const string &path, vector<string> &piece_hashes, string &full_hash, uint64_t &filesize);
+ssize_t read_piece_from_file(const string &path,size_t piece_index,char *buf,size_t bufsize);
+string join_piece_hashes(const vector<string> &v);
+vector<string> split_piece_hashes(const string &s);
 
 #endif 

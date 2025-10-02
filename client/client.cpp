@@ -16,7 +16,7 @@
 #include <set>
 #include <condition_variable>
 #include <sys/stat.h>
-#include<fstream>
+#include <fstream>
 
 const std::string UPLOADS_REGISTRY = ".uploads_registry";
 std::string cached_password="";
