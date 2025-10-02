@@ -146,8 +146,8 @@ void apply_op_line(const string &line){
         else group_files[gid][filename]=fm;
         return;
     }
-    if(parts[0]=="STOP_SHARE" && parts.size()==4){
-        string gid=parts[1], filename=parts[2], peer=parts[3];
+    if(parts[0]=="STOP_SHARE" && parts.size()==5){
+        string gid=parts[1], filename=parts[2], peer=parts[3]+":"+parts[4];
         if(group_files.count(gid) && group_files[gid].count(filename)){
             FileMeta &fm=group_files[gid][filename];
             fm.seeders.erase(remove(fm.seeders.begin(),fm.seeders.end(),peer),fm.seeders.end());
@@ -693,14 +693,32 @@ void handle_client(int client_fd){
             }
             if(words[0]=="stop_share"){
                 // Expected: stop_share <gid> <filename>
-                if(words.size()!=3){
+                if(words.size()!=5){
                     reply="Invaid arguments for stop_share";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
-                string gid=words[1], filename=words[2];
-
-                string op = "STOP_SHARE|" + gid + "|" + filename + "|" + peer;
+                string gid=words[1], filename=words[2],seeder_ip=words[3],seeder_port=words[4];
+                if(current_user.empty()){
+                    reply="you_must_login_first";
+                    send_reply_with_marker(client_fd,reply);
+                    continue;
+                }
+                {
+                    lock_guard<mutex> lock(state_mutex);
+                    if(!groups.count(gid)){
+                        reply="no_such_group";
+                        send_reply_with_marker(client_fd,reply);
+                        continue;
+                    }
+                    auto &members = groups[gid].members;
+                    if(find(members.begin(), members.end(), current_user) == members.end()){
+                        reply="not_member";
+                        send_reply_with_marker(client_fd,reply);
+                        continue;
+                    }
+                }
+                string op = "STOP_SHARE|" + gid + "|" + filename + "|" + seeder_ip+"|"+seeder_port;
                 if(append_to_log(op)){
                     apply_op_line(op);
                     reply="OK stopped";

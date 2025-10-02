@@ -335,7 +335,7 @@ void peer_server_thread(){
         string cmd,filename; 
         int piece_idx;
         ss>>cmd>>filename>>piece_idx;
-        if(cmd!="GET_PIECE"){ 
+        if(cmd!="GET_PIECE"||filename.empty()||piece_idx<0){ 
             close(cfd); 
             continue; 
         }
@@ -918,9 +918,10 @@ int main(int argc,char *argv[]) {
             }
             string gid=words[1],filename=words[2];
             string localip=get_local_ip_from_socket(sock>=0?sock:0);
-            string cmdline="Stop_share "+gid+" "+filename+" "+localip+" "+to_string(peer_listen_port);
+            string cmdline="stop_share "+gid+" "+filename+" "+localip+" "+to_string(peer_listen_port);
             string tmp1;
             send_with_failover(cmdline,tmp1);
+            cout<<tmp1<<endl;
             continue;
         }
         else{
