@@ -224,41 +224,99 @@ bool send_command_noresp(string cmd) {
     return true;
 }
 
-bool send_with_failover(string cmd) {
-    string dummy;
+// old: bool send_with_failover(string cmd, bool is_login = false)
+bool send_with_failover(const string &cmd, string &out_reply, bool is_login = false) {
+    out_reply.clear();
     int attempts = 0;
     int start = (current_tracker >= 0) ? current_tracker : 0;
+    int tried = 0;
 
     while(attempts < trackers.size()) {
+        // ensure socket connected to 'start'
         if(sock < 0) {
             int s = connect_to_tracker(start);
             if(s >= 0) {
                 sock = s;
                 cout << "Connected to tracker " << trackers[start].ip << ":" << trackers[start].port << "\n";
             } else {
-                // try next tracker
+                // could not connect to this tracker; try next
                 start = (start + 1) % trackers.size();
                 attempts++;
                 continue;
             }
         }
 
-        if(send_command(cmd, dummy)) {
-            cout << dummy << "\n";
-            return true;
+        string reply_local;
+        if(send_command(cmd, reply_local)) {
+            // check for session errors (only if not login/create_user/session)
+            if(!is_login &&
+               (reply_local.find("ERR you should login first") != string::npos ||
+                reply_local.find("ERR already_logged_in_on_this_client") != string::npos)) {
+
+                cout << "[Failover] Session lost on tracker "
+                     << trackers[start].ip << ":" << trackers[start].port << "\n";
+
+                // Keep cached_uid (we need it to try auto-login). Clear session token only.
+                cached_session.clear();
+
+                // Attempt auto-login only if we have credentials
+                if(!cached_password.empty() && !cached_uid.empty()) {
+                    string login_cmd = "login " + cached_uid + " " + cached_password;
+                    string login_reply;
+                    // try login on the same tracker first
+                    if(send_command(login_cmd, login_reply)) {
+                        // check if login succeeded
+                        if(login_reply.find("OK login_success") == 0) {
+                            // extract token in case tracker returned it
+                            // parse first line for token
+                            size_t posn = login_reply.find('\n');
+                            string firstline = (posn==string::npos) ? login_reply : login_reply.substr(0,posn);
+                            stringstream ls(firstline);
+                            string ok, tag, token;
+                            ls >> ok >> tag >> token;
+                            if(!token.empty()) {
+                                cached_session = token;
+                                cout << "[Failover] Auto-login succeeded on tracker "
+                                     << trackers[start].ip << ":" << trackers[start].port << "\n";
+                                // retry original command on same tracker
+                                if(send_command(cmd, reply_local)) {
+                                    out_reply = reply_local;
+                                    return true;
+                                }
+                            } else {
+                                // login was OK but token not found — treat as failure to be safe
+                                cout << "[Failover] Auto-login response missing token\n";
+                            }
+                        } else {
+                            cout << "[Failover] Auto-login failed: " << login_reply << "\n";
+                        }
+                    } else {
+                        cout << "[Failover] Auto-login attempt failed to contact tracker\n";
+                    }
+                } else {
+                    cout << "[Failover] No cached credentials for auto-login\n";
+                }
+                // fall through to try next tracker (after closing current socket)
+            } else {
+                // success and not a session error (or it's a login request)
+                out_reply = reply_local;
+                return true;
+            }
+        } else {
+            // send_command failed (socket dropped or read error)
         }
 
-        // command failed, try next tracker
-        cout << "Tracker " << trackers[start].ip << ":" << trackers[start].port << " failed, trying next tracker\n";
-        close(sock);
-        sock = -1;
+        // failure on this tracker -> close and try next
+        if(sock >= 0) { close(sock); sock = -1; }
         start = (start + 1) % trackers.size();
         attempts++;
     }
 
-    cout << "All trackers down\n";
+    cout << "All trackers down or command failed on all trackers\n";
     return false;
 }
+
+
 
 
 string get_local_ip_from_socket(int s){
@@ -406,9 +464,26 @@ int main(int argc,char *argv[]) {
         string w;
         while(ssin>>w) words.push_back(w);
         if(words.size()==0) continue;
+        if(words[0] == "create_user") {
+            if(words.size() != 3) {
+                cout << "ERR usage: create_user <uid> <pw>\n";
+                continue;
+            }
 
+            string cmd = "create_user " + words[1] + " " + words[2];
+            string reply;
+
+            // send_with_failover handles tracker failover and session consistency
+            if(!send_with_failover(cmd, reply)) {
+                cout << "Tracker request failed\n";
+                continue;
+            }
+
+            cout << reply << "\n";
+            continue;
+        }
         // If user tries to login via this client, intercept to capture session token
-        if(words[0] == "login") {
+        else if(words[0] == "login") {
             if(words.size()!=3){
                 cout<<"Usage: login <uid> <pw>\n";
                 continue;
@@ -466,6 +541,7 @@ int main(int argc,char *argv[]) {
                     if(!token.empty()){
                         cached_uid = words[1];
                         cached_session = token;
+                        cached_password=words[2];
                         cout << firstline << "\n";
 
                         // <<< CHANGED: Ensure peer server is running so peer_listen_port is set
@@ -496,8 +572,8 @@ int main(int argc,char *argv[]) {
                                     << filesize << " " << localip << " " << peer_listen_port << " "
                                     << full_hash << " " << piece_hashes.size();
                                 for(auto &ph : piece_hashes) out << " " << ph;
-
-                                if(!send_with_failover(out.str()))
+                                string dummy;
+                                if(!send_with_failover(out.str(),dummy))
                                     cout << "[Auto-Reannounce] " << filename << " -> failed\n";
                                 else
                                     cout << "[Auto-Reannounce] " << filename << " -> success\n";
@@ -516,13 +592,77 @@ int main(int argc,char *argv[]) {
                 continue;
             }
         }
+        else if(words[0] == "create_group") {
+            if(words.size() != 2) { cout << "Usage: create_group <group_id>\n"; continue; }
+            if(cached_uid.empty() || cached_session.empty()) { cout << "ERR you should login first\n"; continue; }
 
-
-
-        // Intercept logout to clear cached session on success
-        if(words[0] == "logout") {
+            string cmdline = "create_group " + words[1];
             string reply;
-            if(!send_command(cmd, reply)){
+            if(!send_with_failover(cmdline, reply)) { cout << "Tracker request failed\n"; continue; }
+
+            cout << reply << "\n";
+            continue;
+        }
+        else if(words[0] == "join_group") {
+            if(words.size() != 2) { cout << "Usage: join_group <group_id>\n"; continue; }
+            if(cached_uid.empty() || cached_session.empty()) { cout << "ERR you should login first\n"; continue; }
+
+            string cmdline = "join_group " + words[1];
+            string reply;
+            if(!send_with_failover(cmdline, reply)) { cout << "Tracker request failed\n"; continue; }
+
+            cout << reply << "\n";
+            continue;
+        }
+        else if(words[0] == "leave_group") {
+            if(words.size() != 2) { cout << "Usage: leave_group <group_id>\n"; continue; }
+            if(cached_uid.empty() || cached_session.empty()) { cout << "ERR you should login first\n"; continue; }
+
+            string cmdline = "leave_group " + words[1];
+            string reply;
+            if(!send_with_failover(cmdline, reply)) { cout << "Tracker request failed\n"; continue; }
+
+            cout << reply << "\n";
+            continue;
+        }
+
+        else if(words[0] == "list_groups") {
+            if(words.size() != 1) { cout << "Usage: list_groups\n"; continue; }
+            if(cached_uid.empty() || cached_session.empty()) { cout << "ERR you should login first\n"; continue; }
+
+            string reply;
+            if(!send_with_failover("list_groups", reply)) { cout << "Tracker request failed\n"; continue; }
+
+            cout << reply << "\n";
+            continue;
+        }
+        else if(words[0] == "list_requests") {
+            if(words.size() != 2) { cout << "Usage: list_requests <group_id>\n"; continue; }
+            if(cached_uid.empty() || cached_session.empty()) { cout << "ERR you should login first\n"; continue; }
+
+            string cmdline = "list_requests " + words[1];
+            string reply;
+            if(!send_with_failover(cmdline, reply)) { cout << "Tracker request failed\n"; continue; }
+
+            cout << reply << "\n";
+            continue;
+        }
+
+        else if(words[0] == "accept_request") {
+            if(words.size() != 3) { cout << "Usage: accept_request <group_id> <user_id>\n"; continue; }
+            if(cached_uid.empty() || cached_session.empty()) { cout << "ERR you should login first\n"; continue; }
+
+            string cmdline = "accept_request " + words[1] + " " + words[2];
+            string reply;
+            if(!send_with_failover(cmdline, reply)) { cout << "Tracker request failed\n"; continue; }
+
+            cout << reply << "\n";
+            continue;
+        }
+        // Intercept logout to clear cached session on success
+        else if(words[0] == "logout") {
+            string reply;
+            if(!send_with_failover(cmd,reply)){
                 cout<<"Tracker request failed\n";
                 continue;
             }
@@ -538,7 +678,7 @@ int main(int argc,char *argv[]) {
         }
 
         // dispatch certain commands client-side
-        if(words[0] == "upload_file") {
+        else if(words[0] == "upload_file") {
             // Expected: upload_file <gid> <file_path_or_name>
             if(words.size() != 3) {
                 cout << "ERR usage: upload_file <gid> <file_path>\n";
@@ -580,26 +720,34 @@ int main(int argc,char *argv[]) {
             for(auto &ph : piece_hashes) out << " " << ph;
 
             // --- Send with automatic failover ---
-            if(!send_with_failover(out.str())) {
+            string upr;
+            if(!send_with_failover(out.str(),upr)) {
                 cout << "ERR upload_failed\n";
             }
             else {
-                cout << "Upload registered\n";
-                save_upload_record(cached_uid,gid,filename,filepath);
+                string firstline;
+                size_t ppos = upr.find('\n');
+                firstline = (ppos==string::npos) ? upr : upr.substr(0, ppos);
+                if(firstline.rfind("OK",0) == 0) {
+                    cout << "Upload registered\n";
+                    save_upload_record(cached_uid,gid,filename,filepath);
+                } else {
+                    cout << firstline << "\n";
+                }
             }
             continue;
         }
-
-        if(words[0]=="list_files"){
+        else if(words[0]=="list_files"){
             if(words.size()!=2){
                 cout<<"Usage: list_files <gid>\n";
                 continue;
             }
-            send_with_failover(cmd);
+            string lrep;
+            send_with_failover(cmd,lrep);
+            cout<<lrep<<endl;
             continue;
         }
-
-        if(words[0] == "download_file") {
+        else if(words[0] == "download_file") {
             if(words.size() != 4) {
                 cout << "ERR usage: download_file <gid> <filename> <destination_folder>\n";
                 continue;
@@ -636,7 +784,7 @@ int main(int argc,char *argv[]) {
             // Request file info from tracker
             string ask = "download_file " + gid + " " + filename;
             string reply;
-            if(!send_command(ask, reply)) {
+            if(!send_with_failover(ask,reply)) {
                 cout << "Tracker request failed\n";
                 if(!try_connect() || !send_command(ask, reply)) {
                     cout << "All trackers unavailable\n";
@@ -794,7 +942,7 @@ int main(int argc,char *argv[]) {
             continue;
         }
 
-        if(words[0]=="show_downloads"){
+        else if(words[0]=="show_downloads"){
             lock_guard<mutex> lg(downloads_mutex);
             if(downloads.empty()){
                 cout<<"No downloads\n";
@@ -810,7 +958,7 @@ int main(int argc,char *argv[]) {
             continue;
         }
 
-        if(words[0]=="stop_share"){
+        else if(words[0]=="stop_share"){
             if(words.size()!=3){
                 cout<<"Invalid commands\n";
                 continue;
@@ -821,11 +969,17 @@ int main(int argc,char *argv[]) {
             string gid=words[1],filename=words[2];
             string localip=get_local_ip_from_socket(sock>=0?sock:0);
             string cmdline="Stop_share "+gid+" "+filename+" "+localip+" "+to_string(peer_listen_port);
-            send_with_failover(cmdline);
+            string tmp1;
+            send_with_failover(cmdline,tmp1);
+            continue;
+        }
+        else{
+            cout<<"Invalid command"<<endl;
             continue;
         }
         // default: send raw to tracker (send_with_failover will apply session wrapper)
-        send_with_failover(cmd);
+        string tmp;
+        send_with_failover(cmd,tmp);
     }
     if(sock>=0) close(sock);
     return 0;
