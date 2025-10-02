@@ -8,8 +8,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-
-// ---------- minimal SHA1 implementation ----------
 #include <stdint.h>
 typedef uint32_t u32;
 typedef uint8_t u8;

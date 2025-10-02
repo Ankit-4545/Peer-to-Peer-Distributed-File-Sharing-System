@@ -8,18 +8,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-
-// ---------- minimal SHA1 implementation ----------
 #include <stdint.h>
-// typedef uint32_t uint32_t;
-// typedef uint8_t uint8_t;
-
 struct SHA1_CTX {
     uint32_t state[5];
     uint32_t count[2];
     uint8_t buffer[64];
 };
-
 static void SHA1Transform(uint32_t state[5], const uint8_t buffer[64]);
 
 static void SHA1Init(SHA1_CTX* context){
@@ -72,7 +66,7 @@ static void SHA1Final(uint8_t digest[20],SHA1_CTX* context){
 
 #define ROL(value, bits) (((value) << (bits)) | ((value) >> (32-(bits))))
 
-static void SHA1Transform(uint32_t state[5], const uint8_t buffer[64]){
+static void SHA1Transform(uint32_t state[5],const uint8_t buffer[64]){
     uint32_t a,b,c,d,e,t;
     uint32_t w[80];
     for(int i=0;i<16;i++){

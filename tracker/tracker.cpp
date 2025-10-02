@@ -37,7 +37,7 @@ map<string,User> users;
 map<string,Group> groups;
 map<string,map<string,FileMeta>> group_files;
 mutex state_mutex;
-map<string,string> active_sessions; // session->user
+map<string,string> active_sessions;
 
 const string SYNC_LOG="sync_log.txt";
 off_t last_offset=0;
@@ -67,20 +67,18 @@ vector<string> split(const string &s,char delim){
     out.push_back(cur);
     return out;
 }
-
+//apply any command to log file
 void apply_op_line(const string &line){
     if(line.empty()) return;
     vector<string> parts=split(line,'|');
     if(parts.size()==0) return;
     lock_guard<mutex>lock(state_mutex);
-
     if(parts[0]=="CREATE_USER" && parts.size()==3){
         string uid=parts[1];
         string pw=parts[2];
         if(!users.count(uid)) users[uid]={pw,false, ""};
         return;
     }
-
     if(parts[0]=="CREATE_GROUP" && parts.size()==3){
     string gid=parts[1], own=parts[2];
     if(!groups.count(gid)) {
@@ -88,12 +86,11 @@ void apply_op_line(const string &line){
     }
     return;
     }
-
-    if(parts[0] == "JOIN_REQ" && parts.size() == 3) {
-        string gid = parts[1], uid = parts[2];
-        if(groups.count(gid)) {
-            auto &reqs = groups[gid].requests;
-            if(find(reqs.begin(), reqs.end(), uid) == reqs.end()) {
+    if(parts[0]=="JOIN_REQ"&&parts.size()==3){
+        string gid=parts[1],uid=parts[2];
+        if(groups.count(gid)){
+            auto &reqs=groups[gid].requests;
+            if(find(reqs.begin(),reqs.end(),uid)==reqs.end()){
                 reqs.push_back(uid);
             }
         }
@@ -111,8 +108,6 @@ void apply_op_line(const string &line){
         }
         return;
     }
-
-
     if(parts[0]=="LOGIN" && parts.size()==3){
         string uid=parts[1], sid=parts[2];
         if(users.count(uid)) {
@@ -121,7 +116,6 @@ void apply_op_line(const string &line){
         }
         return;
     }
-
     if(parts[0]=="LOGOUT" && parts.size()==2){
         string uid=parts[1];
         if(users.count(uid)){ 
@@ -130,7 +124,6 @@ void apply_op_line(const string &line){
         }
         return;
     }
-
     if(parts[0]=="LEAVE_GROUP" && parts.size()==3){
         string gid=parts[1], uid=parts[2];
         if(groups.count(gid)){
@@ -139,7 +132,6 @@ void apply_op_line(const string &line){
         }
         return;
     }
-
     if(parts[0]=="UPLOAD_FILE" && parts.size()>=7){
         string gid=parts[1], filename=parts[2];
         uint64_t filesize=stoull(parts[3]);
@@ -154,18 +146,17 @@ void apply_op_line(const string &line){
         else group_files[gid][filename]=fm;
         return;
     }
-
     if(parts[0]=="STOP_SHARE" && parts.size()==4){
         string gid=parts[1], filename=parts[2], peer=parts[3];
         if(group_files.count(gid) && group_files[gid].count(filename)){
             FileMeta &fm=group_files[gid][filename];
-            fm.seeders.erase(remove(fm.seeders.begin(),fm.seeders.end(),peer), fm.seeders.end());
+            fm.seeders.erase(remove(fm.seeders.begin(),fm.seeders.end(),peer),fm.seeders.end());
             if(fm.seeders.empty()) group_files[gid].erase(filename);
         }
     }
 }
-
-bool append_op_to_log(const string &line){
+//add command to log file
+bool append_to_log(const string &line){
     lock_guard<mutex> lock(file_mutex);
     int fd=open(SYNC_LOG.c_str(),O_WRONLY|O_APPEND|O_CREAT,0644);
     if(fd<0){
@@ -177,7 +168,7 @@ bool append_op_to_log(const string &line){
     close(fd);
     return w==(ssize_t)out.size();
 }
-
+//replay log file on failover
 void replay_log_full(){
     int fd0=open(SYNC_LOG.c_str(),O_RDONLY);
     if(fd0<0){
@@ -217,9 +208,7 @@ void replay_log_full(){
         kv.second.session="";
     }
 }
-
-
-
+//reads any new operation added to log file
 void read_new_ops_from_log(){
     lock_guard<mutex> lock(file_mutex);
     int fd=open(SYNC_LOG.c_str(),O_RDONLY);
@@ -249,14 +238,14 @@ void read_new_ops_from_log(){
     if(off>=0) last_offset=off;
     close(fd);
 }
-
+//frequently reads new operation
 void watcher_thread(){
     while(true){ 
         read_new_ops_from_log(); 
         this_thread::sleep_for(chrono::milliseconds(800));
     }
 }
-
+//send reply to client
 bool send_reply_with_marker(int fd,const string &reply){
     string out=reply; 
     if(out.empty()||out.back()!='\n') out+="\n";
@@ -269,15 +258,13 @@ bool send_reply_with_marker(int fd,const string &reply){
     }
     return true;
 }
-
+//generate session token to identify session
 string generate_session(){
     string chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; 
     string tok;
     for(int i=0;i<16;i++) tok+=chars[rand()%chars.size()];
     return tok;
 }
-
-
 void handle_client(int client_fd){
     string current_user, 
     current_session;
@@ -313,36 +300,34 @@ void handle_client(int client_fd){
                 send_reply_with_marker(client_fd,"Empty command"); 
                 continue; 
             }
-
             // handle session reuse for failover
             if(words[0]=="session"){
                 if(words.size()<4){ 
-                    reply="ERR usage: session <uid> <token> <command>"; 
+                    reply="Invalid arguments for session"; 
                     send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
                 string uid=words[1], token=words[2];
                 if(!set_session(uid, token, current_user, current_session)){ 
-                    reply="ERR invalid_session"; 
+                    reply="invalid_session"; 
                     send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
                 words.erase(words.begin(), words.begin()+3);
             }
-
-            // ---------- handle commands like before ----------
+            //handle command
             if(words[0]=="create_user"){
                 if(!current_user.empty()){ 
-                    reply="ERR cannot_create_user_while_logged_in"; 
+                    reply="cannot_create_user_while_logged_in"; 
                     send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
                 if(words.size()!=3){ 
-                    reply="ERR usage: create_user <uid> <pw>"; 
+                    reply="Invalid arguments for create_user"; 
                     send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
-                string uid=words[1], pw=words[2];
+                string uid=words[1],pw=words[2];
                 { 
                     lock_guard<mutex> lock(state_mutex); 
                     if(users.count(uid)){ 
@@ -352,23 +337,22 @@ void handle_client(int client_fd){
                     } 
                 }
                 string op="CREATE_USER|"+uid+"|"+pw;
-                if(append_op_to_log(op)){ 
+                if(append_to_log(op)){ 
                     apply_op_line(op); 
                     reply="OK user_created"; 
                 } 
-                else reply="ERR log_append";
+                else reply="log_append for create_user";
                 send_reply_with_marker(client_fd,reply); 
                 continue;
             }
-
             if(words[0]=="login"){
                 if(!current_user.empty()){ 
-                    reply="ERR already_logged_in_on_this_client"; 
+                    reply="already_logged_in_on_this_client"; 
                     send_reply_with_marker(client_fd, reply); 
                     continue;
                 }
                 if(words.size()!=3){ 
-                    reply="ERR usage: login <uid> <pw>"; 
+                    reply="Invalid arguments for login"; 
                     send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
@@ -376,50 +360,48 @@ void handle_client(int client_fd){
                 { 
                     lock_guard<mutex> lock(state_mutex); 
                     if(!users.count(uid) || users[uid].password!=pw){ 
-                        reply="ERR invalid_credentials"; 
+                        reply="invalid_credentials"; 
                         send_reply_with_marker(client_fd,reply); 
                         continue;
                     }
                     if(users[uid].loggedin){ 
-                        reply="ERR already_logged_in"; 
+                        reply="already_logged_in"; 
                         send_reply_with_marker(client_fd,reply); 
                         continue;
                     } 
                 }
                 string session_id = generate_session();
                 string op="LOGIN|"+uid+"|"+session_id;
-                if(append_op_to_log(op)){ 
+                if(append_to_log(op)){ 
                     apply_op_line(op); 
                     reply="OK login_success "+session_id; 
                     current_user=uid; 
                     current_session=session_id; 
                 } 
-                else reply="ERR log_append";
+                else reply="log_append error for login";
                 send_reply_with_marker(client_fd,reply); 
                 continue;
             }
-
             if(words[0]=="logout"){
                 if(current_user.empty()){ 
-                    reply="ERR not_logged_in"; 
+                    reply="not_logged_in"; 
                     send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
                 string op="LOGOUT|"+current_user;
-                if(append_op_to_log(op)){ 
+                if(append_to_log(op)){ 
                     apply_op_line(op); 
                     reply="OK logout_success"; 
                     current_user=""; 
                     current_session="";
                 } 
-                else reply="ERR log_append";
+                else reply="log_append error for logout";
                 send_reply_with_marker(client_fd,reply); 
                 continue;
             }
-
             if(words[0]=="create_group"){
                 if(words.size()!=2){
-                    reply="Invalid command: group can't be created";
+                    reply="Invalid arguments for create_group";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
@@ -432,28 +414,25 @@ void handle_client(int client_fd){
                 {
                     lock_guard<mutex> lock(state_mutex);
                     if(groups.count(gid)){
-                        reply="ERR group_exists";
+                        reply="group_exists";
                         send_reply_with_marker(client_fd,reply);
                         continue;
                     }
                 }
                 string op="CREATE_GROUP|"+gid+"|"+current_user;
-                if(append_op_to_log(op)){
-                    // Do NOT call apply_op_line(op) here
+                if(append_to_log(op)){
                     apply_op_line(op);
                     reply="Group created";
                 }
                 else {
-                    reply="ERR log_append";
+                    reply="log_append error for create_grop";
                 }
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
-
-
             if(words[0]=="join_group"){
                 if(words.size()!=2){
-                    reply="ERR usage: join_group <gid>";
+                    reply="Invalid arguments for join_group";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
@@ -466,32 +445,30 @@ void handle_client(int client_fd){
                 {
                     lock_guard<mutex> lock(state_mutex);
                     if(!groups.count(gid)){
-                        reply="ERR no_such_group";
+                        reply="no_such_group";
                         send_reply_with_marker(client_fd,reply);
                         continue;
                     }
-                    if(find(groups[gid].members.begin(), groups[gid].members.end(), current_user)!=groups[gid].members.end()){
-                        reply="ERR already_member";
+                    if(find(groups[gid].members.begin(), groups[gid].members.end(),current_user)!=groups[gid].members.end()){
+                        reply="already_member";
                         send_reply_with_marker(client_fd,reply);
                         continue;
                     }
                 }
                 string op="JOIN_REQ|"+gid+"|"+current_user;
-                if(append_op_to_log(op)){
+                if(append_to_log(op)){
                     apply_op_line(op);
                     reply="OK request_sent";
                 }
                 else {
-                    reply="ERR log_append";
+                    reply="log_append error in join requests";
                 }
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
-
-
             if(words[0]=="leave_group"){
                 if(words.size()!=2){
-                    reply="ERR usage: leave_group <gid>";
+                    reply="Invalid arguments for leave_group";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
@@ -510,18 +487,16 @@ void handle_client(int client_fd){
                     }
                 }
                 string op="LEAVE_GROUP|"+gid+"|"+current_user;
-                if(append_op_to_log(op)){
+                if(append_to_log(op)){
                     apply_op_line(op);
                     reply="OK left_group";
                 }
                 else {
-                    reply="ERR log_append";
+                    reply="log_append error in leave_group";
                 }
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
-
-
             if(words[0]=="list_groups"){
                 string out;
                 lock_guard<mutex> lock(state_mutex);
@@ -534,7 +509,6 @@ void handle_client(int client_fd){
                 send_reply_with_marker(client_fd,out);
                 continue;
             }
-
             if(words[0]=="list_requests"){
                 if(words.size()!=2){
                     reply="Invalid command for list requests";
@@ -549,7 +523,7 @@ void handle_client(int client_fd){
                     continue;
                 }
                 if(current_user!=groups[gid].owner){
-                    reply="ERR not_owner";
+                    reply="not_owner";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
@@ -563,10 +537,9 @@ void handle_client(int client_fd){
                 send_reply_with_marker(client_fd,out);
                 continue;
             }
-
             if(words[0]=="accept_request"){
                 if(words.size()!=3){
-                    reply="ERR usage: accept_request <gid> <uid>";
+                    reply="Invalid arguments for accept_request";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
@@ -580,43 +553,40 @@ void handle_client(int client_fd){
                 {
                     lock_guard<mutex> lock(state_mutex);
                     if(!groups.count(gid)){
-                        reply="ERR no_such_group";
+                        reply="no_such_group";
                         send_reply_with_marker(client_fd,reply);
                         continue;
                     }
                     if(groups[gid].owner!=current_user){
-                        reply="ERR not_owner";
+                        reply="not_owner";
                         send_reply_with_marker(client_fd,reply);
                         continue;
                     }
                 }
                 string op="ACCEPT_REQ|"+gid+"|"+uid;
-                if(append_op_to_log(op)){
+                if(append_to_log(op)){
                     apply_op_line(op);
                     reply="OK request_accepted";
                 }
                 else {
-                    reply="ERR log_append";
+                    reply="log_append error in accept request";
                 }
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
-
             // Now handle upload_file/list_files/download_file/stop_share concretely
             if(words[0] == "upload_file") {
                 // Minimum expected: upload_file <gid> <filename> <filesize> <peer_ip> <peer_port> <full_hash> <num_pieces> <piece_hashes...>
                 if(words.size() < 8) {
-                    reply = "ERR usage: upload_file <gid> <filename> <filesize> <peer_ip> <peer_port> <full_hash> <num_pieces> <piece_hashes...>";
+                    reply = "Invalid arguments for upload file";
                     send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-
                 if(current_user.empty()) {
-                    reply = "ERR you_must_login_first";
-                    send_reply_with_marker(client_fd, reply);
+                    reply = "you_must_login_first to upload file";
+                    send_reply_with_marker(client_fd,reply);
                     continue;
                 }
-
                 string gid = words[1];
                 string filename = words[2];
                 uint64_t filesize = stoull(words[3]);
@@ -624,53 +594,47 @@ void handle_client(int client_fd){
                 int peer_port = stoi(words[5]);
                 string full_hash = words[6];
                 int num_pieces = stoi(words[7]);
-
-                if(words.size() != 8 + num_pieces) {
-                    reply = "ERR mismatch_num_pieces";
+                if(words.size()!=8+num_pieces) {
+                    reply = "mismatch_num_pieces";
                     send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-
                 vector<string> piece_hashes;
-                for(int i = 0; i < num_pieces; i++) {
-                    piece_hashes.push_back(words[8 + i]);
+                for(int i = 0;i<num_pieces;i++){
+                    piece_hashes.push_back(words[8+i]);
                 }
-
                 // Validate group membership
                 {
                     lock_guard<mutex> lock(state_mutex);
                     if(!groups.count(gid)) {
-                        reply = "ERR no_such_group";
+                        reply = "no_such_group";
                         send_reply_with_marker(client_fd, reply);
                         continue;
                     }
                     auto &members = groups[gid].members;
                     if(find(members.begin(), members.end(), current_user) == members.end()) {
-                        reply = "ERR not_member";
+                        reply = "not_member";
                         send_reply_with_marker(client_fd, reply);
                         continue;
                     }
                 }
-
                 // Construct log entry using all client-provided metadata
                 string peer = peer_ip + ":" + to_string(peer_port);
-                string op = "UPLOAD_FILE|" + gid + "|" + filename + "|" + to_string(filesize) + "|" + peer + "|" 
-                            + full_hash + "|" + join_piece_hashes(piece_hashes);
+                string op = "UPLOAD_FILE|" + gid + "|" +filename + "|" +to_string(filesize)+"|" +peer + "|" 
+                            + full_hash + "|" +join_piece_hashes(piece_hashes);
 
-                if(append_op_to_log(op)) {
+                if(append_to_log(op)) {
                     apply_op_line(op);
                     reply = "OK file_uploaded";
                 } else {
-                    reply = "ERR log_append";
+                    reply = "log append error in upload file";
                 }
-
                 send_reply_with_marker(client_fd, reply);
                 continue;
             }
-
             if(words[0]=="list_files"){
                 if(words.size()!=2){
-                    reply="ERR usage: list_files <gid>";
+                    reply="Invalid arguments for list_files";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
@@ -690,71 +654,58 @@ void handle_client(int client_fd){
                 send_reply_with_marker(client_fd,out);
                 continue;
             }
-
-
             if(words[0] == "download_file") {
                 // Expected: download_file <gid> <filename>
                 if(words.size() != 3) {
-                    reply = "ERR usage: download_file <gid> <filename>";
+                    reply = "invalid command for download";
                     send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-
-                string gid = words[1];
-                string filename = words[2];
-
-                lock_guard<mutex> lock(state_mutex);
-
+                string gid=words[1];
+                string filename=words[2];
+                lock_guard<mutex>lock(state_mutex);
                 // Check if file exists in the group
                 if(!group_files.count(gid) || !group_files[gid].count(filename)) {
-                    reply = "ERR no_such_file";
+                    reply = "no_such_file in the group";
                     send_reply_with_marker(client_fd, reply);
                     continue;
                 }
-
-                FileMeta &fm = group_files[gid][filename];
-
+                FileMeta &fm =group_files[gid][filename];
                 // Build response
                 std::ostringstream oss;
                 oss << "OK " 
-                    << fm.filesize << " "
-                    << fm.filehash << " "
-                    << fm.piece_hashes.size();
-
+                    <<fm.filesize << " "
+                    <<fm.filehash << " "
+                    <<fm.piece_hashes.size();
                 // Append piece hashes
-                for(const auto &ph : fm.piece_hashes) oss << " " << ph;
-
-                // Prepare seeder list, excluding requesting peer
+                for(const auto &ph:fm.piece_hashes)oss<<" "<<ph;
+                // Prepare seeder list excluding requesting peer
                 vector<string> filtered_seeders;
                 for(const auto &s : fm.seeders) {
-                    if(s != peer) filtered_seeders.push_back(s);
+                    if(s != peer)filtered_seeders.push_back(s);
                 }
-
                 oss << " " << filtered_seeders.size();
-                for(const auto &s : filtered_seeders) oss << " " << s;
-
+                for(const auto &s :filtered_seeders) oss<<" "<<s;
                 // Note: Tracker does not use destination path; client handles local saving
-                reply = oss.str();
-                send_reply_with_marker(client_fd, reply);
+                reply=oss.str();
+                send_reply_with_marker(client_fd,reply);
                 continue;
             }
-
-
             if(words[0]=="stop_share"){
                 // Expected: stop_share <gid> <filename>
                 if(words.size()!=3){
-                    reply="ERR usage: stop_share <gid> <filename>";
+                    reply="Invaid arguments for stop_share";
                     send_reply_with_marker(client_fd,reply);
                     continue;
                 }
                 string gid=words[1], filename=words[2];
 
                 string op = "STOP_SHARE|" + gid + "|" + filename + "|" + peer;
-                if(append_op_to_log(op)){
+                if(append_to_log(op)){
                     apply_op_line(op);
                     reply="OK stopped";
                 } else {
-                    reply="ERR log_append";
+                    reply="Log append error for stop_share";
                 }
                 send_reply_with_marker(client_fd,reply);
                 continue;
@@ -763,10 +714,9 @@ void handle_client(int client_fd){
     }
     close(client_fd);
 }
-
 int main(int argc,char** argv){
     if(argc<3){
-        cout<<"Usage: "<<argv[0]<<" tracker_info.txt tracker_no\n";
+        cout<<"Invalid arguments to start"<<endl;
         return 1;
     }
     string infofile=argv[1];
@@ -774,7 +724,7 @@ int main(int argc,char** argv){
     vector<pair<string,int>> trackers;
     ifstream fin(infofile);
     if(!fin.is_open()){
-        cerr<<"Cannot open "<<infofile<<"\n";
+        cerr<<"Cannot open "<<infofile<<endl;
         return 1;
     }
     string tip;
@@ -784,7 +734,7 @@ int main(int argc,char** argv){
     }
     fin.close();
     if(tracker_no<1||tracker_no>(int)trackers.size()){
-        cout<<"Invalid tracker_no\n";
+        cout<<"Invalid tracker_no"<<endl;
         return 1;
     }
     string myip=trackers[tracker_no-1].first;
@@ -815,7 +765,7 @@ int main(int argc,char** argv){
         close(listen_fd);
         return 1;
     }
-    cout<<"Tracker "<<tracker_no<<" listening on "<<myip<<":"<<myport<<"\n";
+    cout<<"Tracker "<<tracker_no<<" listening on "<<myip<<":"<<myport<<endl;
     while(true){
         sockaddr_in client_addr;
         socklen_t cl=sizeof(client_addr);
