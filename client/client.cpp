@@ -20,6 +20,7 @@
 
 const std::string UPLOADS_REGISTRY = ".uploads_registry";
 std::string cached_password="";
+std::string localip;
 #include "files.h"
 using namespace std;
 
@@ -423,7 +424,9 @@ int main(int argc,char *argv[]) {
     else{
         try_connect();
     }
-
+    if (localip.empty()) {
+        localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
+    }
     while(true){
         cout<<"> ";
         string cmd;
@@ -601,7 +604,32 @@ int main(int argc,char *argv[]) {
                 continue; 
             }
             cout << reply << "\n";
-            continue;
+            string gid_to_remove = words[1];
+            auto records = load_upload_records();
+            ofstream out(UPLOADS_REGISTRY, ios::trunc);
+            for(auto &rec : records) {
+                string uid, gid, filename, filepath;
+                tie(uid, gid, filename, filepath) = rec;
+                if(uid != cached_uid || gid != gid_to_remove) {
+                    out << uid << " " << gid << " " << filename << " " << filepath << "\n";
+                }
+            }
+            out.close();
+            for(auto &rec : records) {
+                string uid, gid, filename, filepath;
+                tie(uid, gid, filename, filepath) = rec;
+                if(uid == cached_uid && gid == gid_to_remove) {
+                    string fname_only;
+                    size_t pos = filepath.find_last_of("/\\");
+                    if(pos != string::npos) fname_only = filepath.substr(pos + 1);
+                    else fname_only = filepath;
+                    string cmd_stop = "stop_share " + gid + " " + fname_only + " " 
+                                        + localip + " " 
+                                        + to_string(peer_listen_port);
+                    string tmp;
+                    send_with_failover(cmd_stop, tmp);
+                }
+            }
         }
         else if(words[0] == "list_groups") {
             if(words.size() != 1) { 
@@ -890,6 +918,27 @@ int main(int argc,char *argv[]) {
                 cout << "Download completed and verified\n";
                 lock_guard<mutex> lg(downloads_mutex);
                 downloads[dkey].completed = true;
+                if(!start_peer_server()) {
+                    cout << "Cannot start peer server for sharing\n";
+                } 
+                else{
+                    string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
+                    string filename_only;
+                    size_t pos = fullpath.find_last_of("/\\");
+                    if(pos != string::npos) filename_only = fullpath.substr(pos + 1);
+                    else filename_only = fullpath;
+                    stringstream out;
+                    out << "upload_file " << gid << " " << filename_only << " "
+                        << filesize << " " << localip << " " << peer_listen_port << " "
+                        << fullh << " " << num_pieces;
+                    for(auto &ph : piece_hashes) out << " " << ph;
+                    string dummy;
+                    if(!send_with_failover(out.str(), dummy))
+                        cout << "Announce " << filename_only << " failed\n"<<endl;
+                    else
+                        cout << "Announce " << filename_only << " success"<<endl;
+                    save_upload_record(cached_uid, gid, filename_only, fullpath);
+                }
             } 
             else{
                 cout << "Final hash mismatch"<<endl;
