@@ -838,7 +838,10 @@ int main(int argc,char *argv[]) {
                 if ((off_t)pi * PIECE_SIZE + PIECE_SIZE > filesize)
                     expected_size = filesize - (off_t)pi * PIECE_SIZE;
                 for(int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-                    for(const string &seeder : seeders) {
+                    int start_idx=pi%seeders.size();
+                    for(int k=0;k<seeders.size();++k) {
+                        int sid=(start_idx+k)%seeders.size();
+                        const string &seeder=seeders[sid];
                         size_t ppos = seeder.find(':');
                         string sip = seeder.substr(0, ppos);
                         int sport = atoi(seeder.substr(ppos+1).c_str());
@@ -885,6 +888,7 @@ int main(int argc,char *argv[]) {
                             lock_guard<mutex> lg(downloads_mutex);
                             downloads[dkey].have[pi] = pbuf.size();
                         }
+                        cout <<"\nPiece "<< pi+1<<"downloaded from client "<<(sid+1)<<endl;
                         int done = ++pieces_done;
                         double perc = (double)done / num_pieces * 100.0;
                         cout << "\rDownloaded " << done << "/" << num_pieces << " pieces (" << (int)perc << "%)"<<flush;
