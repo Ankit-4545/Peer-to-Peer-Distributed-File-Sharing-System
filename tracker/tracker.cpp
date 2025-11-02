@@ -672,8 +672,17 @@ void handle_client(int client_fd){
                     <<fm.piece_hashes.size();
                 for(const auto &ph:fm.piece_hashes)oss<<" "<<ph;
                 vector<string> filtered_seeders;
-                for(const auto &s : fm.seeders) {
-                    if(s != peer)filtered_seeders.push_back(s);
+                for (const auto &s : fm.seeders) {
+                    if (s == peer) continue;
+                    // Check if this seeder still exists in tracker records for this file
+                    bool still_sharing = false;
+                    if (group_files.count(gid) && group_files[gid].count(filename)) {
+                        FileMeta &fcheck = group_files[gid][filename];
+                        if (find(fcheck.seeders.begin(), fcheck.seeders.end(), s) != fcheck.seeders.end()) {
+                            still_sharing = true;
+                        }
+                    }
+                    if (still_sharing) filtered_seeders.push_back(s);
                 }
                 oss << " " << filtered_seeders.size();
                 for(const auto &s :filtered_seeders) oss<<" "<<s;
