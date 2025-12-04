@@ -80,11 +80,11 @@ void apply_op_line(const string &line){
         return;
     }
     if(parts[0]=="CREATE_GROUP" && parts.size()==3){
-    string gid=parts[1], own=parts[2];
-    if(!groups.count(gid)) {
-    groups[gid]={own,{own},{}};
-    }
-    return;
+        string gid=parts[1], own=parts[2];
+        if(!groups.count(gid)) {
+            groups[gid]={own,{own},{}};
+        }
+        return;
     }
     if(parts[0]=="JOIN_REQ"&&parts.size()==3){
         string gid=parts[1],uid=parts[2];
