@@ -22,6 +22,7 @@ const std::string UPLOADS_REGISTRY = ".uploads_registry";
 std::string cached_password="";
 std::string localip;
 #include "files.h"
+#include "peer.h"
 using namespace std;
 
 struct Tracker {
@@ -40,19 +41,10 @@ int sock=-1;
 mutex sock_lock;
 string cached_uid="";           
 string cached_session="";       
-int peer_listen_fd=-1;
 int peer_listen_port=0;
-thread peer_thread;
-mutex downloads_mutex;
-struct DownloadStatus {
-    string gid;
-    string filename;
-    uint64_t filesize;
-    size_t num_pieces;
-    vector<size_t> have;
-    bool completed;
-};
-map<string,DownloadStatus>downloads;
+// Serializes use of the tracker connection between the command loop and the
+// background download threads (re-announces and peer-list refreshes).
+recursive_mutex tracker_mtx;
 
 void save_upload_record(const string &uid, const string &gid, const string &filename, const string &filepath) {
     ofstream out(UPLOADS_REGISTRY, ios::app);
@@ -216,6 +208,7 @@ bool send_command_noresp(string cmd) {
 
 //send command with failover handling
 bool send_with_failover(const string &cmd, string &out_reply, bool is_login = false) {
+    lock_guard<recursive_mutex> tracker_guard(tracker_mtx);
     out_reply.clear();
     int attempts = 0;
     int start = (current_tracker >= 0) ? current_tracker : 0;
@@ -306,84 +299,11 @@ string get_local_ip_from_socket(int s){
     return string("127.0.0.1");
 }
 
-void peer_server_thread(){
-    while(true){
-        if(peer_listen_fd<0){
-            this_thread::sleep_for(chrono::milliseconds(200));
-            continue;
-        }
-        sockaddr_in client_addr; 
-        socklen_t cl=sizeof(client_addr);
-        int cfd=accept(peer_listen_fd,(sockaddr*)&client_addr,&cl);
-        if(cfd<0) continue;
-        const int BUF=4096;
-        char buf[BUF];
-        string acc;
-        ssize_t r;
-        while((r=recv(cfd,buf,BUF,0))>0){
-            acc.append(buf,(size_t)r);
-            size_t nl=acc.find('\n');
-            if(nl!=string::npos) break;
-            if(acc.size()>8192) break;
-        }
-        if(acc.empty()){ 
-            close(cfd); 
-            continue; 
-        }
-        string req=acc;
-        if(req.back()=='\n') req.pop_back();
-        stringstream ss(req);
-        string cmd,filename; 
-        int piece_idx;
-        ss>>cmd>>filename>>piece_idx;
-        if(cmd!="GET_PIECE"||filename.empty()||piece_idx<0){ 
-            close(cfd); 
-            continue; 
-        }
-        vector<char> pbuf(PIECE_SIZE);
-        ssize_t got=read_piece_from_file(filename,(size_t)piece_idx,pbuf.data(),pbuf.size());
-        if(got<=0){ 
-            close(cfd); 
-            continue; 
-        }
-        size_t sent=0;
-        while(sent<(size_t)got){
-            ssize_t w=send(cfd,pbuf.data()+sent,got-sent,0);
-            if(w<=0) break;
-            sent+=(size_t)w;
-        }
-        close(cfd);
-    }
-}
-
+// The peer engine (peer.cpp) listens for other peers and runs uploads/downloads.
 bool start_peer_server(){
-    if(peer_listen_fd>0) return true;
-    int s=socket(AF_INET,SOCK_STREAM,0);
-    if(s<0) return false;
-    int opt=1; 
-    setsockopt(s,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-    sockaddr_in addr; 
-    memset(&addr,0,sizeof(addr));
-    addr.sin_family=AF_INET; 
-    addr.sin_addr.s_addr=INADDR_ANY; 
-    addr.sin_port=0;
-    if(::bind(s,(sockaddr*)&addr,sizeof(addr))<0){ 
-        close(s); 
-        return false; 
-    }
-    if(listen(s,10)<0){ 
-        close(s); 
-        return false; 
-    }
-    sockaddr_in as; 
-    socklen_t al=sizeof(as);
-    if(getsockname(s,(sockaddr*)&as,&al)==0){
-        peer_listen_port=ntohs(as.sin_port);
-    }
-    peer_listen_fd=s;
-    peer_thread=thread(peer_server_thread);
-    peer_thread.detach();
-    return true;
+    bool ok=p2p::start_engine();
+    peer_listen_port=p2p::listen_port();
+    return ok;
 }
 
 int main(int argc,char *argv[]) {
@@ -427,13 +347,28 @@ int main(int argc,char *argv[]) {
     if (localip.empty()) {
         localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
     }
+    // Hooks the peer engine uses from its background threads.
+    p2p::tracker_request = [](const string &c, string &reply) {
+        return send_with_failover(c, reply);
+    };
+    p2p::announce_ip = []() {
+        lock_guard<recursive_mutex> lg(tracker_mtx);
+        return get_local_ip_from_socket(sock >= 0 ? sock : 0);
+    };
+    p2p::on_download_complete = [](const string &gid, const string &fname, const string &path) {
+        lock_guard<recursive_mutex> lg(tracker_mtx);
+        save_upload_record(cached_uid, gid, fname, path);
+    };
     while(true){
         cout<<"> ";
         string cmd;
-        getline(cin,cmd);
+        if(!getline(cin,cmd)) break;
         if(cmd=="quit") {
             break;
         }
+        // Commands run one at a time against the tracker; background
+        // downloads wait for the current command to finish.
+        lock_guard<recursive_mutex> tracker_guard(tracker_mtx);
         if(cmd.size()==0) continue;
         stringstream ssin(cmd);
         vector<string> words; 
@@ -528,6 +463,7 @@ int main(int argc,char *argv[]) {
                                 string full_hash;
                                 uint64_t filesize = 0;
                                 if(!compute_file_hashes(filepath, piece_hashes, full_hash, filesize))continue;
+                                p2p::seed_file(gid, filename, filepath, filesize, full_hash, piece_hashes);
                                 string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
                                 if(!start_peer_server())localip = "0.0.0.0";
                                 stringstream out;
@@ -628,6 +564,7 @@ int main(int argc,char *argv[]) {
                                         + to_string(peer_listen_port);
                     string tmp;
                     send_with_failover(cmd_stop, tmp);
+                    p2p::stop_share(gid, fname_only);
                 }
             }
         }
@@ -721,6 +658,11 @@ int main(int argc,char *argv[]) {
                 cout << "cannot_start_peer_server"<<endl;
                 continue;
             }
+            // Serve the file before announcing it, so peers that hear about it can connect at once.
+            if(!p2p::seed_file(gid, filename, filepath, filesize, full_hash, piece_hashes)) {
+                cout << "cannot_open_file"<<endl;
+                continue;
+            }
             string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
             stringstream out;
             out << "upload_file " << gid << " " << filename << " " 
@@ -810,158 +752,17 @@ int main(int argc,char *argv[]) {
             }
             vector<string> seeders(num_seeders);
             for(int i=0;i<num_seeders;i++) ls >> seeders[i];
-            DownloadStatus ds;
-            ds.gid = gid;
-            ds.filename = fullpath;
-            ds.filesize = filesize;
-            ds.num_pieces = num_pieces;
-            ds.have.assign(num_pieces, 0);
-            ds.completed = false;
-            string dkey = gid + ":" + filename;
-            {
-                lock_guard<mutex> lg(downloads_mutex);
-                downloads[dkey] = ds;
-            }
-            int fd = open(fullpath.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
-            if(fd < 0) {
-                cout << "Cannot create file"<<endl;
-                lock_guard<mutex> lg(downloads_mutex);
-                downloads.erase(dkey);
-                continue;
-            }
-            const int MAX_RETRIES = 5;
-            const int MAX_THREADS = 8; 
-            atomic<int> pieces_done(0);
-            mutex fd_mutex;
-            auto download_piece = [&](int pi) -> bool {
-                size_t expected_size = PIECE_SIZE;
-                if ((off_t)pi * PIECE_SIZE + PIECE_SIZE > filesize)
-                    expected_size = filesize - (off_t)pi * PIECE_SIZE;
-                for(int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-                    int start_idx=pi%seeders.size();
-                    for(int k=0;k<seeders.size();++k) {
-                        int sid=(start_idx+k)%seeders.size();
-                        const string &seeder=seeders[sid];
-                        size_t ppos = seeder.find(':');
-                        string sip = seeder.substr(0, ppos);
-                        int sport = atoi(seeder.substr(ppos+1).c_str());
-                        int psock = socket(AF_INET, SOCK_STREAM, 0);
-                        if(psock < 0) continue;
-                        sockaddr_in peeraddr;
-                        memset(&peeraddr,0,sizeof(peeraddr));
-                        peeraddr.sin_family = AF_INET;
-                        peeraddr.sin_port = htons(sport);
-                        peeraddr.sin_addr.s_addr = inet_addr(sip.c_str());
-                        struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
-                        setsockopt(psock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
-                        if(connect(psock,(sockaddr*)&peeraddr,sizeof(peeraddr))<0){
-                            close(psock);
-                            continue;
-                        }
-                        string req = "GET_PIECE " + filename + " " + to_string(pi) + "\n";
-                        if(send(psock, req.c_str(), req.size(), 0) <= 0){
-                            close(psock);
-                            continue;
-                        }
-                        vector<char> pbuf(expected_size);
-                        ssize_t total_rcv = 0;
-                        while(total_rcv < expected_size){
-                            ssize_t rcv = recv(psock, pbuf.data() + total_rcv, expected_size - total_rcv, 0);
-                            if(rcv <= 0) break;
-                            total_rcv += rcv;
-                        }
-                        close(psock);
-                        if((size_t)total_rcv != expected_size) continue;
-                        if(sha1_hex((unsigned char*)pbuf.data(), pbuf.size()) != piece_hashes[pi]) continue;
-                        {
-                            lock_guard<mutex> lg(fd_mutex);
-                            off_t off = (off_t)pi * PIECE_SIZE;
-                            if(lseek(fd, off, SEEK_SET) == (off_t)-1) return false;
-                            size_t wrote = 0;
-                            while(wrote < pbuf.size()){
-                                ssize_t w = write(fd, pbuf.data() + wrote, pbuf.size() - wrote);
-                                if(w <=0) break;
-                                wrote += w;
-                            }
-                        }
-                        {
-                            lock_guard<mutex> lg(downloads_mutex);
-                            downloads[dkey].have[pi] = pbuf.size();
-                        }
-                        cout <<"\nPiece "<< pi+1<<"downloaded from client "<<(sid+1)<<endl;
-                        int done = ++pieces_done;
-                        double perc = (double)done / num_pieces * 100.0;
-                        cout << "\rDownloaded " << done << "/" << num_pieces << " pieces (" << (int)perc << "%)"<<flush;
-                        return true;
-                    }
-                    this_thread::sleep_for(chrono::milliseconds(300));
-                }
-                cout << "\nPiece " << pi+1 << " failed after max retries"<<endl;
-                return false;
-            };
-            vector<thread> workers;
-            atomic<int> next_piece(0);
-            auto worker = [&]() {
-                while(true) {
-                    int pi = next_piece++;
-                    if(pi >= num_pieces) break;
-                    download_piece(pi);
-                }
-            };
-            for(int i=0;i<min(MAX_THREADS,num_pieces);i++) workers.emplace_back(worker);
-            for(auto &t : workers) t.join();
-            cout<<endl;
-            close(fd);
-            vector<string> ph_dummy;
-            string fullh;
-            uint64_t fs2;
-            if(!compute_file_hashes(fullpath, ph_dummy, fullh, fs2)){
-                cout << "Downloaded but cannot compute final hash"<<endl;
-            } 
-            else if(fullh == filehash){
-                cout << "Download completed and verified\n";
-                lock_guard<mutex> lg(downloads_mutex);
-                downloads[dkey].completed = true;
-                if(!start_peer_server()) {
-                    cout << "Cannot start peer server for sharing\n";
-                } 
-                else{
-                    string localip = get_local_ip_from_socket(sock >= 0 ? sock : 0);
-                    string filename_only;
-                    size_t pos = fullpath.find_last_of("/\\");
-                    if(pos != string::npos) filename_only = fullpath.substr(pos + 1);
-                    else filename_only = fullpath;
-                    stringstream out;
-                    out << "upload_file " << gid << " " << filename_only << " "
-                        << filesize << " " << localip << " " << peer_listen_port << " "
-                        << fullh << " " << num_pieces;
-                    for(auto &ph : piece_hashes) out << " " << ph;
-                    string dummy;
-                    if(!send_with_failover(out.str(), dummy))
-                        cout << "Announce " << filename_only << " failed\n"<<endl;
-                    else
-                        cout << "Announce " << filename_only << " success"<<endl;
-                    save_upload_record(cached_uid, gid, filename_only, fullpath);
-                }
-            } 
-            else{
-                cout << "Final hash mismatch"<<endl;
-            }
+            // BitTorrent-style download: runs in the background over persistent
+            // peer connections, resumes from fullpath.part/.state if present, and
+            // starts sharing pieces with other peers as soon as they are verified.
+            string msg;
+            p2p::start_download(gid, filename, fullpath, filesize, filehash, piece_hashes, seeders, msg);
+            peer_listen_port = p2p::listen_port();
+            cout << msg << endl;
             continue;
         }
         else if(words[0]=="show_downloads"){
-            lock_guard<mutex> lg(downloads_mutex);
-            if(downloads.empty()){
-                cout<<"No downloads"<<endl;
-            } 
-            else{
-                for(auto &p:downloads){
-                    const DownloadStatus &ds=p.second;
-                    size_t got=0;
-                    for(size_t x:ds.have) got+=x;
-                    cout<<"["<<(ds.completed?'C':'D')<<"] ["<<ds.gid<<"] "<<ds.filename<<" "<<got<<"/"<<ds.filesize<<"\n";
-                }
-            }
+            p2p::print_downloads();
             continue;
         }
         else if(words[0]=="stop_share"){
@@ -978,6 +779,7 @@ int main(int argc,char *argv[]) {
             string cmdline="stop_share "+gid+" "+filename+" "+localip+" "+to_string(peer_listen_port);
             string tmp1;
             send_with_failover(cmdline,tmp1);
+            p2p::stop_share(gid,filename);
             cout<<tmp1<<endl;
             continue;
         }

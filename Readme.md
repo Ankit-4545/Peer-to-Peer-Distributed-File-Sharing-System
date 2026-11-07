@@ -6,7 +6,8 @@ This project implements a distributed file sharing system with tracker-based coo
 
 ```
 client/
-    client.cpp           Client application source
+    client.cpp           Client application source (commands, tracker connection)
+    peer.cpp, peer.h     BitTorrent-style peer engine (peer protocol, piece picking, choking)
     files.cpp, files.h   File hashing and piece management
     Makefile             Build script for client
     tracker_info.txt     List of tracker IPs and ports
@@ -37,12 +38,21 @@ The tracker maintains detailed file metadata, including size, piece hashes, full
 The client includes libraries for networking, threading, file I/O, and synchronization. It defines structures for Tracker and Peer, and maintains global variables for tracker connections, session info (cached_uid and cached_session), peer server state, and active downloads.
 ### Tracker Connection and Failover:
 Functions like read_tracker_file, connect_to_tracker, try_connect, and send_with_failover handle tracker connections, send commands with session handling, and perform automatic failover and auto-login if a tracker is down or session is lost.
-### Peer-to-Peer Server:
-start_peer_server and peer_server_thread allow the client to listen for incoming requests from peers and serve file pieces. This enables uploading and sharing of files in a P2P network.
+### Peer-to-Peer Engine (peer.cpp):
+Downloads and uploads work like BitTorrent. Each shared file is a torrent identified by its full SHA-1 hash (the info-hash), and peers keep **one persistent TCP connection per peer**, used in both directions:
+* **Handshake** `<14>"P2PFS protocol"<8 reserved><20-byte info-hash><20-byte peer id>`, then length-prefixed messages `<4-byte length><id><payload>`: choke, unchoke, interested, not_interested, have, bitfield, request, piece, cancel, plus keep-alives.
+* **Bitfield / have**: peers exchange which pieces they hold and broadcast `have` for every newly verified piece.
+* **Blocks and pipelining**: pieces (512 KB) are requested as 16 KB blocks with 8 requests in flight per peer. Requests that time out are re-issued elsewhere, and slow (snubbed) peers get one request at a time.
+* **Piece selection**: the first 4 pieces are random, then rarest-first. Pieces already started are finished first.
+* **Endgame mode**: once every missing block has been requested, the remaining blocks are requested from several peers, and the duplicates are cancelled when one arrives.
+* **Choking**: each peer uploads to 3 peers chosen by tit-for-tat (the best download rate, or the best upload rate when seeding), plus 1 optimistic unchoke rotated every 30 s.
+* **Smart ban**: when a piece fails its hash check, every block's hash and sender is recorded. Once the piece verifies, any peer whose block differed is banned.
+* **Swarming**: a downloader announces itself to the tracker as soon as the download starts and serves every verified piece, so peers can finish from each other even after the original seeder leaves. The peer list is refreshed from the tracker every 30 s.
+* **Background downloads and resume**: `download_file` returns immediately. Data goes to `<file>.part`, progress to `<file>.state`, and the file is renamed to its real name only after the full-file hash matches. Running `download_file` again after a crash or `quit` re-verifies the saved pieces and fetches only the missing ones.
 ### Command Handling:
 The main loop interprets user commands, including create_user and login for account management, group commands (create_group, join_group, leave_group, etc.), file operations (upload_file, download_file, list_files), and download management (show_downloads, stop_share). Commands interact with trackers or peers as needed, and responses are validated for correctness.
 ### File Upload and Download Logic:
-Uploads compute file hashes and announce files to the tracker. Downloads retrieve file pieces from multiple seeders in parallel, verify piece and full file hashes, and write them to disk while tracking progress.
+Uploads compute file hashes, register the file with the peer engine, and announce it to the tracker. Downloads run in the background in the peer engine (see above). `show_downloads` shows progress, connected peers, download rate, bytes uploaded, and any hash failures or banned peers.
 ### Error Handling and Cleanup:
 The client provides feedback for invalid commands, connection failures, or hash mismatches. On exit, it closes sockets and cleans up resources to ensure a graceful shutdown.
 
