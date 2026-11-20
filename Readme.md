@@ -27,7 +27,7 @@ State is maintained via a persistent log file (sync_log.txt) where all operation
 ### Command handling:
 The tracker supports commands for user management (create_user, login, logout), group management (create_group, join_group, leave_group, list_groups, list_requests, accept_request), and file operations (upload_file, list_files, download_file, stop_share). Each command validates the client’s session, permissions, and group membership before execution.
 ### Session management:
-Secure sessions are implemented with unique 16-character tokens generated on login. The tracker verifies session tokens for authenticated commands and allows session reuse for failover recovery, ensuring clients can reconnect seamlessly.
+Secure sessions are implemented with unique 16-character tokens generated on login. The tracker verifies session tokens for authenticated commands and allows session reuse for failover recovery, ensuring clients can reconnect seamlessly. Sessions are rebuilt from the shared log when a tracker restarts, so a client can fail over to a restarted tracker with its existing token. A login with the correct password always succeeds and replaces any previous session. A client that crashed without logging out therefore never locks its user out, and a client whose session was replaced gets `invalid_session` and is asked to log in again. It is not logged in again automatically, so two clients of the same user can't keep taking the session from each other.
 ### Thread safety:
 Shared resources such as users, groups, requests, and file metadata are protected by mutexes, and log file access is synchronized. This ensures data consistency and prevents race conditions even under high concurrency.
 ### File sharing and seeder tracking:

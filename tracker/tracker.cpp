@@ -202,10 +202,8 @@ void replay_log_full(){
     off_t off=lseek(fd,0,SEEK_END);
     last_offset=(off<0)?0:off;
     close(fd);
-    for (auto &kv:users){
-        kv.second.loggedin=false;
-        kv.second.session="";
-    }
+    // Sessions rebuilt from the log are kept, so a client failing over to a
+    // restarted tracker keeps working with its existing token.
 }
 //reads any new operation added to log file
 void read_new_ops_from_log(){
@@ -307,8 +305,12 @@ void handle_client(int client_fd){
                     continue;
                 }
                 string uid=words[1], token=words[2];
-                if(!set_session(uid, token, current_user, current_session)){ 
-                    reply="invalid_session"; 
+                if(!set_session(uid, token, current_user, current_session)){
+                    // The token was replaced by a newer login or ended by logout:
+                    // forget this connection's login so it cannot keep acting as uid.
+                    current_user.clear();
+                    current_session.clear();
+                    reply="invalid_session";
                     send_reply_with_marker(client_fd,reply); 
                     continue;
                 }
@@ -359,15 +361,14 @@ void handle_client(int client_fd){
                 { 
                     lock_guard<mutex> lock(state_mutex); 
                     if(!users.count(uid) || users[uid].password!=pw){ 
-                        reply="invalid_credentials"; 
-                        send_reply_with_marker(client_fd,reply); 
+                        reply="invalid_credentials";
+                        send_reply_with_marker(client_fd,reply);
                         continue;
                     }
-                    if(users[uid].loggedin){ 
-                        reply="already_logged_in"; 
-                        send_reply_with_marker(client_fd,reply); 
-                        continue;
-                    } 
+                    // A correct login always succeeds and replaces any existing
+                    // session, so a client that crashed without logging out can
+                    // never lock its user out. The old token stops working on
+                    // every tracker once this LOGIN is in the shared log.
                 }
                 string session_id = generate_session();
                 string op="LOGIN|"+uid+"|"+session_id;

@@ -19,7 +19,6 @@
 #include <fstream>
 
 const std::string UPLOADS_REGISTRY = ".uploads_registry";
-std::string cached_password="";
 std::string localip;
 #include "files.h"
 #include "peer.h"
@@ -207,7 +206,7 @@ bool send_command_noresp(string cmd) {
 }
 
 //send command with failover handling
-bool send_with_failover(const string &cmd, string &out_reply, bool is_login = false) {
+bool send_with_failover(const string &cmd, string &out_reply) {
     lock_guard<recursive_mutex> tracker_guard(tracker_mtx);
     out_reply.clear();
     int attempts = 0;
@@ -226,57 +225,19 @@ bool send_with_failover(const string &cmd, string &out_reply, bool is_login = fa
         }
         string reply_local;
         if(send_command(cmd, reply_local)) {
-            if(!is_login &&
-               (reply_local.find("you should login first") != string::npos ||
-                reply_local.find("already_logged_in_on_this_client") != string::npos)){
-                cout << "Failover Session lost on tracker "
-                     << trackers[start].ip << ":" << trackers[start].port << "\n";
+            // Trackers share sessions through the log (even across restarts), so
+            // invalid_session means this session really ended: the user logged in
+            // from another client or logged out. Don't log in again automatically,
+            // or two clients of the same user would keep taking the session from
+            // each other.
+            if(reply_local.rfind("invalid_session", 0) == 0) {
+                cached_uid.clear();
                 cached_session.clear();
-                // Attempt auto-login only if we have credentials
-                if(!cached_password.empty()&&!cached_uid.empty()) {
-                    string login_cmd="login "+cached_uid + " " + cached_password;
-                    string login_reply;
-                    // try login on the same tracker first
-                    if(send_command(login_cmd, login_reply)) {
-                        // check if login succeeded
-                        if(login_reply.find("OK login_success") == 0) {
-                            // parse first line for token
-                            size_t posn = login_reply.find('\n');
-                            string firstline = (posn==string::npos) ? login_reply : login_reply.substr(0,posn);
-                            stringstream ls(firstline);
-                            string ok, tag, token;
-                            ls >> ok >> tag >> token;
-                            if(!token.empty()) {
-                                cached_session = token;
-                                cout << "Failover Auto-login succeeded on tracker "
-                                     << trackers[start].ip << ":" << trackers[start].port << "\n";
-                                // retry original command on same tracker
-                                if(send_command(cmd, reply_local)) {
-                                    out_reply = reply_local;
-                                    return true;
-                                }
-                            } 
-                            else{
-                                cout<<"Failover Auto-login response missing token\n";
-                            }
-                        } 
-                        else{
-                            cout<<"Failover Auto-login failed: "<<login_reply << "\n";
-                        }
-                    } 
-                    else{
-                        cout<<"Failover Auto-login attempt failed to contact tracker\n";
-                    }
-                } 
-                else{
-                    cout << "Failover No cached credentials for auto-login\n";
-                }
-            } 
-            else{
-                out_reply = reply_local;
-                return true;
+                reply_local = "Session ended (logged in from another client or logged out). Please login again.";
             }
-        } 
+            out_reply = reply_local;
+            return true;
+        }
         if(sock >= 0){
             close(sock); 
             sock = -1; 
@@ -442,7 +403,6 @@ int main(int argc,char *argv[]) {
                     if(!token.empty()){
                         cached_uid = words[1];
                         cached_session = token;
-                        cached_password=words[2];
                         cout << firstline << "\n";
                         //Ensure peer server is running so peer_listen_port is set
                         if(!start_peer_server()) {
