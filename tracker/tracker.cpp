@@ -18,6 +18,9 @@
 #include <cerrno>
 #include <cstdlib>
 #include <ctime>
+#include <random>
+#include <chrono>
+#include <sys/file.h>
 
 #include "files.h"
 using namespace std;
@@ -26,11 +29,13 @@ struct User{
     string password;
     bool loggedin;
     string session;
+    string creator;   // request id of the CREATE_USER line that won
 };
 struct Group{
     string owner;
     vector<string> members;
     vector<string> requests;
+    string creator;   // request id of the CREATE_GROUP line that won
 };
 
 map<string,User> users;
@@ -73,16 +78,21 @@ void apply_op_line(const string &line){
     vector<string> parts=split(line,'|');
     if(parts.size()==0) return;
     lock_guard<mutex>lock(state_mutex);
-    if(parts[0]=="CREATE_USER" && parts.size()==3){
+    // Creates carry a request id. The first line for a name in the log wins,
+    // and the creator field records whose request that was, so the tracker
+    // that wrote a losing line can tell its client the name was taken.
+    if(parts[0]=="CREATE_USER" && (parts.size()==3 || parts.size()==4)){
         string uid=parts[1];
         string pw=parts[2];
-        if(!users.count(uid)) users[uid]={pw,false, ""};
+        string rid=parts.size()==4 ? parts[3] : "";
+        if(!users.count(uid)) users[uid]={pw,false,"",rid};
         return;
     }
-    if(parts[0]=="CREATE_GROUP" && parts.size()==3){
+    if(parts[0]=="CREATE_GROUP" && (parts.size()==3 || parts.size()==4)){
         string gid=parts[1], own=parts[2];
+        string rid=parts.size()==4 ? parts[3] : "";
         if(!groups.count(gid)) {
-            groups[gid]={own,{own},{}};
+            groups[gid]={own,{own},{},rid};
         }
         return;
     }
@@ -90,7 +100,9 @@ void apply_op_line(const string &line){
         string gid=parts[1],uid=parts[2];
         if(groups.count(gid)){
             auto &reqs=groups[gid].requests;
-            if(find(reqs.begin(),reqs.end(),uid)==reqs.end()){
+            auto &m=groups[gid].members;
+            if(find(m.begin(),m.end(),uid)==m.end() &&
+               find(reqs.begin(),reqs.end(),uid)==reqs.end()){
                 reqs.push_back(uid);
             }
         }
@@ -100,6 +112,8 @@ void apply_op_line(const string &line){
         string gid = parts[1], uid = parts[2];
         if(groups.count(gid)) {
             auto &r = groups[gid].requests;
+            // Only a pending request can be accepted.
+            if(find(r.begin(), r.end(), uid) == r.end()) return;
             r.erase(remove(r.begin(), r.end(), uid), r.end());
             auto &m = groups[gid].members;
             if(find(m.begin(), m.end(), uid) == m.end()) {
@@ -134,7 +148,8 @@ void apply_op_line(const string &line){
     }
     if(parts[0]=="UPLOAD_FILE" && parts.size()>=7){
         string gid=parts[1], filename=parts[2];
-        uint64_t filesize=stoull(parts[3]);
+        uint64_t filesize=0;
+        try { filesize=stoull(parts[3]); } catch(...) { return; }
         string peer=parts[4], filehash=parts[5];
         vector<string> ph=split(parts[6],',');
         if(!group_files.count(gid)) group_files[gid]={};
@@ -155,70 +170,48 @@ void apply_op_line(const string &line){
         }
     }
 }
-//add command to log file
-bool append_to_log(const string &line){
+//add command to log file. Returns the offset just past the new line, or -1.
+off_t append_to_log(const string &line){
     lock_guard<mutex> lock(file_mutex);
     int fd=open(SYNC_LOG.c_str(),O_WRONLY|O_APPEND|O_CREAT,0644);
     if(fd<0){
-        cerr<<"open("<<SYNC_LOG<<") failed: "<<strerror(errno)<<"\n"; 
-        return false;
+        cerr<<"open("<<SYNC_LOG<<") failed: "<<strerror(errno)<<"\n";
+        return -1;
+    }
+    // Lock the file so the other tracker's line can never be interleaved with
+    // ours, even on filesystems where O_APPEND alone is not atomic.
+    if(flock(fd,LOCK_EX)<0){
+        close(fd);
+        return -1;
     }
     string out=line+"\n";
-    ssize_t w=write(fd,out.c_str(),out.size());
-    close(fd);
-    return w==(ssize_t)out.size();
-}
-//replay log file on failover
-void replay_log_full(){
-    int fd0=open(SYNC_LOG.c_str(),O_RDONLY);
-    if(fd0<0){
-        if(errno==ENOENT){ 
-            int fdw=open(SYNC_LOG.c_str(),O_WRONLY|O_CREAT,0644); 
-            if(fdw>=0) close(fdw); 
-        } 
+    size_t done=0;
+    while(done<out.size()){
+        ssize_t w=write(fd,out.c_str()+done,out.size()-done);
+        if(w<0 && errno==EINTR) continue;
+        if(w<=0) break;
+        done+=(size_t)w;
     }
-    else close(fd0);
-
+    off_t end=(done==out.size()) ? lseek(fd,0,SEEK_CUR) : -1;
+    flock(fd,LOCK_UN);
+    close(fd);
+    return end;
+}
+//reads any new operation added to log file and applies it.
+//Only complete lines are consumed: if the other tracker is in the middle of
+//writing a line, the partial line is left for the next read instead of being
+//skipped. Returns how far the log has been applied.
+off_t read_new_ops_from_log(){
     lock_guard<mutex> lock(file_mutex);
     int fd=open(SYNC_LOG.c_str(),O_RDONLY);
-    if(fd<0){
-        last_offset=0; 
-        return;
+    if(fd<0) return last_offset;
+    if(lseek(fd,last_offset,SEEK_SET)==(off_t)-1){
+        close(fd);
+        return last_offset;
     }
-
     string acc;
-    const int BUF=4096; char buf[BUF]; ssize_t r;
-    while((r=read(fd,buf,BUF))>0){
-        acc.append(buf,(size_t)r);
-        size_t pos=0;
-        while(true){
-            size_t nl=acc.find('\n',pos);
-            if(nl==string::npos) break;
-            string line=acc.substr(pos,nl-pos);
-            apply_op_line(line); pos=nl+1;
-        }
-        if(pos>0) acc.erase(0,pos);
-    }
-    off_t off=lseek(fd,0,SEEK_END);
-    last_offset=(off<0)?0:off;
-    close(fd);
-    // Sessions rebuilt from the log are kept, so a client failing over to a
-    // restarted tracker keeps working with its existing token.
-}
-//reads any new operation added to log file
-void read_new_ops_from_log(){
-    lock_guard<mutex> lock(file_mutex);
-    int fd=open(SYNC_LOG.c_str(),O_RDONLY);
-    if(fd<0) return;
-    if(lseek(fd,last_offset,SEEK_SET)==(off_t)-1){ 
-        last_offset=lseek(fd,0,SEEK_END); 
-        close(fd); 
-        return;
-    }
-
-    string acc; 
-    const int BUF=4096; 
-    char buf[BUF]; 
+    const int BUF=4096;
+    char buf[BUF];
     ssize_t r;
     while((r=read(fd,buf,BUF))>0){
         acc.append(buf,(size_t)r);
@@ -226,14 +219,40 @@ void read_new_ops_from_log(){
         while(true){
             size_t nl=acc.find('\n',pos);
             if(nl==string::npos) break;
-            string line=acc.substr(pos,nl-pos);
-            apply_op_line(line); pos=nl+1;
+            apply_op_line(acc.substr(pos,nl-pos));
+            pos=nl+1;
         }
-        if(pos>0) acc.erase(0,pos);
+        last_offset+=(off_t)pos;   // advance past complete lines only
+        acc.erase(0,pos);
     }
-    off_t off=lseek(fd,0,SEEK_END);
-    if(off>=0) last_offset=off;
     close(fd);
+    return last_offset;
+}
+//replay log file on startup
+void replay_log_full(){
+    int fdw=open(SYNC_LOG.c_str(),O_WRONLY|O_CREAT,0644);
+    if(fdw>=0) close(fdw);
+    {
+        lock_guard<mutex> lock(file_mutex);
+        last_offset=0;
+    }
+    // Sessions rebuilt from the log are kept, so a client failing over to a
+    // restarted tracker keeps working with its existing token.
+    read_new_ops_from_log();
+}
+//Write an operation to the shared log, then apply the log up to and including
+//it. Every tracker applies operations only in log order, so all trackers end
+//up in the same state, and the caller can check the result to see whether its
+//operation took effect (for example, whether it won a race for a name).
+bool commit_op(const string &op){
+    off_t end=append_to_log(op);
+    if(end<0) return false;
+    for(int i=0;i<200;i++){
+        if(read_new_ops_from_log()>=end) return true;
+        // An earlier line is still being written; wait for it to finish.
+        this_thread::sleep_for(chrono::milliseconds(5));
+    }
+    return false;
 }
 //frequently reads new operation
 void watcher_thread(){
@@ -255,12 +274,43 @@ bool send_reply_with_marker(int fd,const string &reply){
     }
     return true;
 }
+//random token from the OS random source (/dev/urandom), not rand(): tokens
+//must be unpredictable and must differ between trackers started together.
+mutex rng_mutex;
+string random_token(size_t n){
+    static const string chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    static random_device rd;
+    lock_guard<mutex> lock(rng_mutex);
+    string tok;
+    while(tok.size()<n){
+        unsigned int x=rd();
+        // reject values that would bias the result toward some characters
+        if(x >= (0xFFFFFFFFu/chars.size())*chars.size()) continue;
+        tok+=chars[x%chars.size()];
+    }
+    return tok;
+}
 //generate session token to identify session
 string generate_session(){
-    string chars="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; 
-    string tok;
-    for(int i=0;i<16;i++) tok+=chars[rand()%chars.size()];
-    return tok;
+    return random_token(16);
+}
+//parse a non-negative decimal number; false on anything else
+bool parse_u64(const string &s, uint64_t &out){
+    if(s.empty() || s.size()>19) return false;
+    uint64_t v=0;
+    for(char c:s){
+        if(c<'0'||c>'9') return false;
+        v=v*10+(uint64_t)(c-'0');
+    }
+    out=v;
+    return true;
+}
+bool is_sha1_hex(const string &s){
+    if(s.size()!=40) return false;
+    for(char c:s){
+        if(!((c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F'))) return false;
+    }
+    return true;
 }
 void handle_client(int client_fd){
     string current_user, 
@@ -296,6 +346,16 @@ void handle_client(int client_fd){
             if(words.size()==0){ 
                 send_reply_with_marker(client_fd,"Empty command"); 
                 continue; 
+            }
+            // Apply anything the other tracker has written before answering, so
+            // a client that just failed over sees its own recent changes (and a
+            // token from a login on the other tracker is already known).
+            read_new_ops_from_log();
+            bool bad_char=false;
+            for(auto &x:words) if(x.find('|')!=string::npos) bad_char=true;
+            if(bad_char){
+                send_reply_with_marker(client_fd,"Invalid character '|' in command");
+                continue;
             }
             // handle session reuse for failover
             if(words[0]=="session"){
@@ -337,12 +397,16 @@ void handle_client(int client_fd){
                         continue;
                     } 
                 }
-                string op="CREATE_USER|"+uid+"|"+pw;
-                if(append_to_log(op)){ 
-                    apply_op_line(op); 
-                    reply="OK user_created"; 
-                } 
-                else reply="log_append for create_user";
+                // Two trackers may both pass the check above for the same name.
+                // Both lines go into the log; the first one wins on every
+                // tracker, and only the client whose request id won gets OK.
+                string rid=random_token(16);
+                string op="CREATE_USER|"+uid+"|"+pw+"|"+rid;
+                if(commit_op(op)){
+                    lock_guard<mutex> lock(state_mutex);
+                    reply = (users.count(uid) && users[uid].creator==rid) ? "OK user_created" : "User already exists";
+                }
+                else reply="log_append error for create_user";
                 send_reply_with_marker(client_fd,reply); 
                 continue;
             }
@@ -372,8 +436,7 @@ void handle_client(int client_fd){
                 }
                 string session_id = generate_session();
                 string op="LOGIN|"+uid+"|"+session_id;
-                if(append_to_log(op)){ 
-                    apply_op_line(op); 
+                if(commit_op(op)){
                     reply="OK login_success "+session_id; 
                     current_user=uid; 
                     current_session=session_id; 
@@ -389,8 +452,7 @@ void handle_client(int client_fd){
                     continue;
                 }
                 string op="LOGOUT|"+current_user;
-                if(append_to_log(op)){ 
-                    apply_op_line(op); 
+                if(commit_op(op)){
                     reply="OK logout_success"; 
                     current_user=""; 
                     current_session="";
@@ -419,13 +481,15 @@ void handle_client(int client_fd){
                         continue;
                     }
                 }
-                string op="CREATE_GROUP|"+gid+"|"+current_user;
-                if(append_to_log(op)){
-                    apply_op_line(op);
-                    reply="Group created";
+                // Same rule as create_user: the first line in the log wins.
+                string rid=random_token(16);
+                string op="CREATE_GROUP|"+gid+"|"+current_user+"|"+rid;
+                if(commit_op(op)){
+                    lock_guard<mutex> lock(state_mutex);
+                    reply = (groups.count(gid) && groups[gid].creator==rid) ? "Group created" : "group_exists";
                 }
                 else {
-                    reply="log_append error for create_grop";
+                    reply="log_append error for create_group";
                 }
                 send_reply_with_marker(client_fd,reply);
                 continue;
@@ -456,9 +520,13 @@ void handle_client(int client_fd){
                     }
                 }
                 string op="JOIN_REQ|"+gid+"|"+current_user;
-                if(append_to_log(op)){
-                    apply_op_line(op);
-                    reply="OK request_sent";
+                if(commit_op(op)){
+                    // Report what actually happened once the log is applied
+                    // (e.g. the owner may have accepted us in the meantime).
+                    lock_guard<mutex> lock(state_mutex);
+                    auto &m=groups[gid].members;
+                    if(find(m.begin(),m.end(),current_user)!=m.end()) reply="already_member";
+                    else reply="OK request_sent";
                 }
                 else {
                     reply="log_append error in join requests";
@@ -487,8 +555,7 @@ void handle_client(int client_fd){
                     }
                 }
                 string op="LEAVE_GROUP|"+gid+"|"+current_user;
-                if(append_to_log(op)){
-                    apply_op_line(op);
+                if(commit_op(op)){
                     reply="OK left_group";
                 }
                 else {
@@ -562,11 +629,24 @@ void handle_client(int client_fd){
                         send_reply_with_marker(client_fd,reply);
                         continue;
                     }
+                    auto &m=groups[gid].members;
+                    if(find(m.begin(),m.end(),uid)!=m.end()){
+                        reply="already_member";
+                        send_reply_with_marker(client_fd,reply);
+                        continue;
+                    }
+                    auto &r=groups[gid].requests;
+                    if(find(r.begin(),r.end(),uid)==r.end()){
+                        reply="no_such_request";
+                        send_reply_with_marker(client_fd,reply);
+                        continue;
+                    }
                 }
                 string op="ACCEPT_REQ|"+gid+"|"+uid;
-                if(append_to_log(op)){
-                    apply_op_line(op);
-                    reply="OK request_accepted";
+                if(commit_op(op)){
+                    lock_guard<mutex> lock(state_mutex);
+                    auto &m=groups[gid].members;
+                    reply = (find(m.begin(),m.end(),uid)!=m.end()) ? "OK request_accepted" : "no_such_request";
                 }
                 else {
                     reply="log_append error in accept request";
@@ -587,19 +667,36 @@ void handle_client(int client_fd){
                 }
                 string gid = words[1];
                 string filename = words[2];
-                uint64_t filesize = stoull(words[3]);
+                // Validate every field instead of letting stoull/stoi throw:
+                // an uncaught exception here would kill the whole tracker.
+                uint64_t filesize = 0, port_num = 0, num_pieces = 0;
                 string peer_ip = words[4];
-                int peer_port = stoi(words[5]);
                 string full_hash = words[6];
-                int num_pieces = stoi(words[7]);
-                if(words.size()!=8+num_pieces) {
+                in_addr ip_check;
+                if(!parse_u64(words[3], filesize) || !parse_u64(words[5], port_num) ||
+                   port_num < 1 || port_num > 65535 || !parse_u64(words[7], num_pieces) ||
+                   inet_pton(AF_INET, peer_ip.c_str(), &ip_check) != 1 || !is_sha1_hex(full_hash)) {
+                    reply = "invalid_upload_arguments";
+                    send_reply_with_marker(client_fd, reply);
+                    continue;
+                }
+                int peer_port = (int)port_num;
+                if(num_pieces != (filesize + PIECE_SIZE - 1) / PIECE_SIZE ||
+                   words.size() != 8 + num_pieces) {
                     reply = "mismatch_num_pieces";
                     send_reply_with_marker(client_fd, reply);
                     continue;
                 }
                 vector<string> piece_hashes;
-                for(int i = 0;i<num_pieces;i++){
+                bool bad_hash = false;
+                for(uint64_t i = 0; i < num_pieces; i++){
+                    if(!is_sha1_hex(words[8+i])) bad_hash = true;
                     piece_hashes.push_back(words[8+i]);
+                }
+                if(bad_hash) {
+                    reply = "invalid_upload_arguments";
+                    send_reply_with_marker(client_fd, reply);
+                    continue;
                 }
                 // Validate group membership
                 {
@@ -620,8 +717,7 @@ void handle_client(int client_fd){
                 string op = "UPLOAD_FILE|" + gid + "|" +filename + "|" +to_string(filesize)+"|" +peer + "|" 
                             + full_hash + "|" +join_piece_hashes(piece_hashes);
 
-                if(append_to_log(op)) {
-                    apply_op_line(op);
+                if(commit_op(op)) {
                     reply = "OK file_uploaded";
                 } else {
                     reply = "log append error in upload file";
@@ -718,8 +814,7 @@ void handle_client(int client_fd){
                     }
                 }
                 string op = "STOP_SHARE|" + gid + "|" + filename + "|" + seeder_ip+"|"+seeder_port;
-                if(append_to_log(op)){
-                    apply_op_line(op);
+                if(commit_op(op)){
                     reply="OK stopped";
                 } else {
                     reply="Log append error for stop_share";
@@ -757,7 +852,6 @@ int main(int argc,char** argv){
     string myip=trackers[tracker_no-1].first;
     int myport=trackers[tracker_no-1].second;
 
-    srand(time(0));
     replay_log_full();
     thread watcher(watcher_thread);
     watcher.detach();
