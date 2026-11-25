@@ -41,7 +41,11 @@ The tracker maintains detailed file metadata, including size, piece hashes, full
 ### Initialization and Global Setup:
 The client includes libraries for networking, threading, file I/O, and synchronization. It defines structures for Tracker and Peer, and maintains global variables for tracker connections, session info (cached_uid and cached_session), peer server state, and active downloads.
 ### Tracker Connection and Failover:
-Functions like read_tracker_file, connect_to_tracker, try_connect, and send_with_failover handle tracker connections, send commands with session handling, and perform automatic failover and auto-login if a tracker is down or session is lost.
+Failover happens on the client side: the client detects that its tracker is down and moves to another one by itself, without the user doing anything and without logging in again.
+* **Tracker list**: `read_tracker_file` loads every tracker from `tracker_info.txt`. At startup the client connects to the tracker given on the command line (`connect_to_tracker`). If that tracker is unreachable, `try_connect` tries the others in order.
+* **Every request goes through `send_with_failover`**: user commands and the peer engine's background requests (announces, peer-list refreshes) all use it. If sending or receiving fails, the socket is closed, the client connects to the next tracker in the list (round robin), and the **same command is sent again**. Each tracker is tried once. If none of them answer, the client prints `All trackers down`.
+* **The session survives the switch**: after login the client keeps `cached_uid` and `cached_session`. Every later command is sent as `session <uid> <token> <command>`. Both trackers share logins through `sync_log.txt`, so the new tracker already knows the token and runs the command as that user.
+* **No automatic re-login**: if a tracker replies `invalid_session` (the user logged in from another client or logged out), the client clears its cached session and asks the user to log in again. It does not log in again by itself, so two clients of the same user can't keep taking the session from each other.
 ### Peer-to-Peer Engine (peer.cpp):
 Downloads and uploads work like BitTorrent. Each shared file is a torrent identified by its full SHA-1 hash (the info-hash), and peers keep **one persistent TCP connection per peer**, used in both directions:
 * **Handshake** `<14>"P2PFS protocol"<8 reserved><20-byte info-hash><20-byte peer id>`, then length-prefixed messages `<4-byte length><id><payload>`: choke, unchoke, interested, not_interested, have, bitfield, request, piece, cancel, plus keep-alives.
@@ -72,7 +76,7 @@ Each downloaded piece is verified against its hash, and the complete file is che
 
 ### Assumption made
 * Both tracker is up at the start.
-* If a tracker goes down it wont come up in the current session.
+* A tracker that goes down may be restarted. On startup it replays `sync_log.txt` to rebuild its state and sessions, so clients can fail over to it again with their existing session token.
 
 ## Execution instruction:
 1. For tracker:
