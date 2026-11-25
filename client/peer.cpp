@@ -950,14 +950,12 @@ static void connect_peers(const shared_ptr<Torrent> &t, const vector<string> &ad
 
 // ---------- tracker interaction (never called with an engine lock held) ----------
 
+// Reply to get_peers: "OK <count> <ip:port> ..."
 static bool parse_peer_reply(const string &reply, vector<string> &peers) {
     stringstream ls(reply);
-    string status, hash, tmp;
-    uint64_t fs;
-    int n, k;
+    string status, tmp;
+    int k;
     if (!(ls >> status) || status != "OK") return false;
-    if (!(ls >> fs >> hash >> n)) return false;
-    for (int i = 0; i < n; i++) ls >> tmp;
     if (!(ls >> k)) return false;
     for (int i = 0; i < k && (ls >> tmp); i++) peers.push_back(tmp);
     return true;
@@ -1001,7 +999,7 @@ static void tracker_work(shared_ptr<Torrent> t, bool announce, bool finish, bool
     if (query) {
         string reply;
         vector<string> peers;
-        if (tracker_request && tracker_request("download_file " + t->gid + " " + t->filename, reply))
+        if (tracker_request && tracker_request("get_peers " + t->gid + " " + t->filename, reply))
             parse_peer_reply(reply, peers);
         connect_peers(t, peers);
         lock_guard<mutex> lk(t->mtx);

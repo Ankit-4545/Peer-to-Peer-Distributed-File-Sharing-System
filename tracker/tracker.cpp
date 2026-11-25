@@ -312,6 +312,14 @@ bool is_sha1_hex(const string &s){
     }
     return true;
 }
+// "<count> <ip:port> ..." for a file's seeders, leaving out the asking connection.
+string seeder_list(const FileMeta &fm, const string &self){
+    vector<string> out;
+    for(const auto &s : fm.seeders) if(s != self) out.push_back(s);
+    string r = to_string(out.size());
+    for(const auto &s : out) r += " " + s;
+    return r;
+}
 void handle_client(int client_fd){
     string current_user, 
     current_session;
@@ -768,22 +776,28 @@ void handle_client(int client_fd){
                     <<fm.filehash << " "
                     <<fm.piece_hashes.size();
                 for(const auto &ph:fm.piece_hashes)oss<<" "<<ph;
-                vector<string> filtered_seeders;
-                for (const auto &s : fm.seeders) {
-                    if (s == peer) continue;
-                    // Check if this seeder still exists in tracker records for this file
-                    bool still_sharing = false;
-                    if (group_files.count(gid) && group_files[gid].count(filename)) {
-                        FileMeta &fcheck = group_files[gid][filename];
-                        if (find(fcheck.seeders.begin(), fcheck.seeders.end(), s) != fcheck.seeders.end()) {
-                            still_sharing = true;
-                        }
-                    }
-                    if (still_sharing) filtered_seeders.push_back(s);
-                }
-                oss << " " << filtered_seeders.size();
-                for(const auto &s :filtered_seeders) oss<<" "<<s;
+                oss << " " << seeder_list(fm, peer);
                 reply=oss.str();
+                send_reply_with_marker(client_fd,reply);
+                continue;
+            }
+            // Seeder list only. A downloader already has the file size and
+            // hashes from download_file, so its periodic peer-list refresh asks
+            // for just the seeders instead of every piece hash again.
+            if(words[0] == "get_peers") {
+                if(words.size() != 3) {
+                    reply = "Invalid arguments for get_peers";
+                    send_reply_with_marker(client_fd, reply);
+                    continue;
+                }
+                string gid=words[1], filename=words[2];
+                lock_guard<mutex>lock(state_mutex);
+                if(!group_files.count(gid) || !group_files[gid].count(filename)) {
+                    reply = "no_such_file in the group";
+                    send_reply_with_marker(client_fd, reply);
+                    continue;
+                }
+                reply = "OK " + seeder_list(group_files[gid][filename], peer);
                 send_reply_with_marker(client_fd,reply);
                 continue;
             }
